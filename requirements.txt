@@ -1,0 +1,5 @@
+aiohttp==3.12.6
+colorama==0.4.6
+loguru==0.7.0
+seahorse==1.1.6b5
+numpy
