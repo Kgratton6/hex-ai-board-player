@@ -199,33 +199,68 @@ class MyPlayer(PlayerHex):
         opp_bridge_holes_all = self._bridge_holes(st_hex, opp_type)
         # Affinage sur un sous-ensemble (top_k) avec distance; borne temps ~ min(0.25 s, 1/3 du budget)
         refined = []
+        # Debug ordonnancement: (posAN, base, final, used_stage2, adj_bonus, bh_penalty)
+        order_debug: list[tuple[str, float, float, bool, float, bool]] = []
+        n_dim = rep_board.get_dimensions()[0]
         start_order = time.perf_counter()
         top_k = min(16, max(6, len(base_scored) // 5))
         order_time_cap = min(0.25, max(0.08, (self._deadline - start) / 3.0))
         for idx, (a, base_val) in enumerate(base_scored):
             child_for_penalty: Optional[GameStateHex] = None
+            pos = a.data.get("position")
+            used_stage2 = False
+            adj_bonus = 0.0
             if idx < top_k and (time.perf_counter() - start_order) < order_time_cap:
                 child_top = cast(GameStateHex, st_hex.apply_action(a))
                 score = self._root_order_score(child_top)
                 child_for_penalty = child_top
+                used_stage2 = True
                 # Petit bonus d'adjacence locale (évite l'isolement complet)
-                pos = a.data.get("position")
                 if isinstance(pos, tuple) and len(pos) == 2:
                     adj = self._friendly_neighbors_count(st_hex, cast(tuple[int,int], pos), self.piece_type)
-                    score += 0.08 * (adj / 6.0)
+                    adj_bonus = 0.08 * (adj / 6.0)
+                    score += adj_bonus
             else:
                 score = base_val
             # Pénalité légère si on joue dans un trou de pont adverse (sauf blocage ou gain immédiat)
-            pos = a.data.get("position")
+            bh_penalty = False
             if isinstance(pos, tuple) and len(pos) == 2 and pos in opp_bridge_holes_all and (pos not in threats):
                 if child_for_penalty is None:
                     child_for_penalty = cast(GameStateHex, st_hex.apply_action(a))
                 if self._utility(child_for_penalty) != 1:
                     score -= 0.12
+                    bh_penalty = True
             refined.append((a, score))
- 
+            # Enregistrer debug pour ce coup
+            try:
+                pos_s = self._pos_to_an(pos, n_dim) if isinstance(pos, tuple) and len(pos) == 2 else "?"
+                order_debug.append((pos_s, float(base_val), float(score), used_stage2, float(adj_bonus), bh_penalty))
+            except Exception:
+                pass
+
+        spent_ms = (time.perf_counter() - start_order) * 1000.0
         refined.sort(key=lambda t: t[1], reverse=True)
         actions = [a for (a, _) in refined]
+
+        # Résumés d’ordonnancement
+        try:
+            print(f"[MyPlayer] order n={len(base_scored)} top_k={top_k} cap_ms={order_time_cap*1000:.1f} spent_ms={spent_ms:.1f}")
+            dbg_map = {d[0]: d for d in order_debug}
+            top_list = []
+            for a, sc in refined[:5]:
+                p = a.data.get("position")
+                key = self._pos_to_an(p, n_dim) if isinstance(p, tuple) and len(p) == 2 else "?"
+                d = dbg_map.get(key)
+                flags = ""
+                if d:
+                    _, _, _, used_r2, adj_b, pen = d
+                    if used_r2: flags += "*r2"
+                    if adj_b > 0.0: flags += "+adj"
+                    if pen: flags += "-bh"
+                top_list.append(f"{key}:{sc:.3f}{flags}")
+            print(f"[MyPlayer] order_top5={','.join(top_list)}")
+        except Exception:
+            pass
 
         for action in actions:
             child = cast(GameStateHex, st_hex.apply_action(action))
