@@ -1,4 +1,4 @@
-from typing import Optional, cast
+from typing import Optional, cast, Any
 import random
 import time
 
@@ -197,6 +197,17 @@ class MyPlayer(PlayerHex):
         # Pré-calcul: trous de pont de l'adversaire (éviter d'y jouer sans nécessité)
         opp_type = "B" if self.piece_type == "R" else "R"
         opp_bridge_holes_all = self._bridge_holes(st_hex, opp_type)
+
+        # Pré-calcul: candidats de réduction bord (rangée/colonne 2) qui réduisent la distance de connexion
+        curr_dist_conn = self._connection_distance(st_hex, self.piece_type)
+        border_reduce_candidates = self._border_reduce_candidates_from_actions(st_hex, self.piece_type, curr_dist_conn, actions)
+        try:
+            n_dim = rep_board.get_dimensions()[0]
+            br_list = ",".join(self._pos_to_an(p, n_dim) for p in border_reduce_candidates)
+            print(f"[MyPlayer] border_candidates=[{br_list}]")
+        except Exception:
+            pass
+
         # Affinage sur un sous-ensemble (top_k) avec distance; borne temps ~ min(0.25 s, 1/3 du budget)
         refined = []
         # Debug ordonnancement: (posAN, base, final, used_stage2, adj_bonus, bh_penalty)
@@ -222,6 +233,23 @@ class MyPlayer(PlayerHex):
                     score += adj_bonus
             else:
                 score = base_val
+            # Micro-biais de flanc: si le dernier coup adverse est sur/près d'un bord,
+            # privilégier l'anneau 2 du MÊME flanc (colonne 1 ou n-2 pour Bleu, ligne 1 ou n-2 pour Rouge)
+            if isinstance(pos, tuple) and len(pos) == 2 and last_pos is not None:
+                n_side = n_dim
+                if self.piece_type == "B":
+                    if last_pos[1] <= 1 and pos[1] == 1:
+                        score += 0.06
+                    elif last_pos[1] >= n_side - 2 and pos[1] == n_side - 2:
+                        score += 0.06
+                else:
+                    if last_pos[0] <= 1 and pos[0] == 1:
+                        score += 0.06
+                    elif last_pos[0] >= n_side - 2 and pos[0] == n_side - 2:
+                        score += 0.06
+            # Bonus léger si coup de réduction bord détecté
+            if isinstance(pos, tuple) and len(pos) == 2 and pos in border_reduce_candidates:
+                score += 0.12
             # Pénalité légère si on joue dans un trou de pont adverse (sauf blocage ou gain immédiat)
             bh_penalty = False
             if isinstance(pos, tuple) and len(pos) == 2 and pos in opp_bridge_holes_all and (pos not in threats):
@@ -257,6 +285,17 @@ class MyPlayer(PlayerHex):
                     if used_r2: flags += "*r2"
                     if adj_b > 0.0: flags += "+adj"
                     if pen: flags += "-bh"
+                # Marquer bonus réduction bord
+                if isinstance(p, tuple) and len(p) == 2 and p in border_reduce_candidates:
+                    flags += "+br"
+                # Marquer biais de flanc si applicable
+                if isinstance(p, tuple) and len(p) == 2 and last_pos is not None:
+                    if self.piece_type == "B":
+                        if (last_pos[1] <= 1 and p[1] == 1) or (last_pos[1] >= n_dim - 2 and p[1] == n_dim - 2):
+                            flags += "+fl"
+                    else:
+                        if (last_pos[0] <= 1 and p[0] == 1) or (last_pos[0] >= n_dim - 2 and p[0] == n_dim - 2):
+                            flags += "+fl"
                 top_list.append(f"{key}:{sc:.3f}{flags}")
             print(f"[MyPlayer] order_top5={','.join(top_list)}")
         except Exception:
@@ -284,6 +323,15 @@ class MyPlayer(PlayerHex):
             pass
         # Choix final
         chosen = best_action if best_action is not None else actions[0]
+        # Log si le coup choisi est une réduction bord
+        try:
+            pos_ch = chosen.data.get("position")
+            if isinstance(pos_ch, tuple) and len(pos_ch) == 2:
+                if pos_ch in border_reduce_candidates:
+                    n_dim = rep_board.get_dimensions()[0]
+                    print(f"[MyPlayer] border_reduce={self._pos_to_an(pos_ch, n_dim)}")
+        except Exception:
+            pass
         # Mémoriser l’état APRÈS notre coup pour déduire exactement le prochain last_opp
         try:
             pos_played = chosen.data.get("position")
@@ -354,15 +402,36 @@ class MyPlayer(PlayerHex):
 
     def _evaluate(self, state: GameStateHex) -> float:
         """
-        Evaluation rapide (cheap) pour toutes les feuilles de l'arbre:
-        - "random": bruit faible
-        - sinon: différence de pièces normalisée + centralité légère (pas de Dijkstra)
+        Phase 2 — Evaluation principale combinant:
+        - base rapide (_fast_static_eval): pions, ancrage, présence, centre, etc.
+        - distance de connexion (opp_dist - my_dist) normalisée par n
         """
+        # 1) terminal
         if state.is_done():
             return float(self._utility(state))
+
+        # 2) mode aléatoire (inchangé)
         if self._heuristic == "random":
             return random.uniform(-0.1, 0.1)
-        return self._fast_static_eval(state)
+
+        # 3) base actuelle
+        base = self._fast_static_eval(state)
+
+        # 4) distances de connexion
+        my_type = self.piece_type
+        opp_type = "B" if my_type == "R" else "R"
+
+        my_dist = self._connection_distance(state, my_type)
+        opp_dist = self._connection_distance(state, opp_type)
+
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+
+        # plus c'est grand, mieux c'est pour nous (ils sont plus loin que nous)
+        dist_term = (opp_dist - my_dist) / max(1, n)
+
+        # 5) combinaison avec poids significatif pour la distance
+        return float(0.55 * base + 0.45 * dist_term)
 
     def _fast_static_eval(self, state: GameStateHex) -> float:
         """
@@ -708,6 +777,44 @@ class MyPlayer(PlayerHex):
         col = chr(ord('A') + j)
         return f"{col}{i + 1}"
 
+    def _border_reduce_candidates_from_actions(
+        self,
+        state: GameStateHex,
+        piece_type: str,
+        d0: Optional[int],
+        actions: list[LightAction]
+    ) -> set[tuple[int, int]]:
+        """
+        Détection simple des coups "réduction de bord" (3→2):
+        - On ne considère que l'anneau 2 par rapport aux bords cibles:
+          * Rouge (vertical): i == 1 ou i == n-2
+          * Bleu  (horizontal): j == 1 ou j == n-2
+        - Un coup est retenu s'il réduit la distance de connexion d'au moins 1.
+        """
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+        if d0 is None:
+            d0 = self._connection_distance(state, piece_type)
+
+        def in_ring2(pos: tuple[int, int]) -> bool:
+            i, j = pos
+            if piece_type == "R":
+                return i == 1 or i == n - 2
+            else:
+                return j == 1 or j == n - 2
+
+        cands: set[tuple[int, int]] = set()
+        for a in actions:
+            pos = a.data.get("position")
+            if not (isinstance(pos, tuple) and len(pos) == 2 and in_ring2(pos)):
+                continue
+            child = cast(GameStateHex, state.apply_action(a))
+            d1 = self._connection_distance(child, piece_type)
+            if d1 <= d0 - 1:
+                cands.add(pos)
+        return cands
+
+ 
     # ---------- Helpers H1 (distance/centre) ----------
 
     def _connection_distance(self, state: GameStateHex, piece_type: str) -> int:
