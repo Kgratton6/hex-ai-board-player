@@ -1,6 +1,7 @@
 from typing import Optional, cast, Any
 import random
 import time
+import heapq
 
 from player_hex import PlayerHex
 from seahorse.game.action import Action
@@ -12,385 +13,1381 @@ from board_hex import BoardHex
 
 class MyPlayer(PlayerHex):
     """
-    Joueur Hex avec Minimax + élagage alpha-bêta.
-    Heuristique simple (différence de pions) ou aléatoire, au choix.
+    Agent Hex avec:
+    - P0-P4: Alpha-bêta, H1 (distance+centre), ordering racine, bridge réactif
+    - P3.2: Épine dorsale (spine) + bonus bridges guidés + gradient
+    - P5: Réduction de bord 3→2
+    - P6: Filtrage dead cells
+    - P7: Must-play de couloir
+    - P9: IDS (Iterative Deepening Search)
+    - P10: Table de transposition (Zobrist)
     """
 
-    def __init__(self, piece_type: str, name: str = "MyPlayer", max_depth: int = 3, heuristic: str = "simple"):
-        """
-        Args:
-            piece_type (str): "R" ou "B"
-            name (str): nom du joueur
-            max_depth (int): profondeur de recherche (>=1)
-            heuristic (str): "simple" (diff de pions) ou "random"
-        """
+    def __init__(self, piece_type: str, name: str = "MyPlayer", max_depth: int = 4):
         super().__init__(piece_type, name)
         self.max_depth = max(1, int(max_depth))
-        self._heuristic = heuristic if heuristic in ("simple", "random") else "simple"
-        # Stats internes (non sérialisées si préfixées par '_')
+        
+        # Stats (préfixées _ pour ne pas apparaître dans JSON)
         self._nodes_visited = 0
         self._depth_reached = 0
-        self._last_stats = {}
         self._deadline: float = float("inf")
-        # Snapshot des cases occupées (pour déduire le dernier coup adverse)
         self._prev_positions: set[tuple[int, int]] = set()
+        
+        # Table de transposition (Zobrist)
+        self._tt: dict[int, tuple[float, int, str, Optional[tuple[int,int]]]] = {}
+        self._zobrist_table: dict[tuple[str, int, int], int] = {}
+        self._zobrist_side: dict[int, int] = {}
+        self._init_zobrist()
+
+    def _init_zobrist(self):
+        """Initialise la table Zobrist pour le hashing d'états"""
+        random.seed(42)  # Pour reproductibilité
+        for piece_type in ["R", "B"]:
+            for i in range(14):
+                for j in range(14):
+                    self._zobrist_table[(piece_type, i, j)] = random.getrandbits(64)
+        self._zobrist_side[0] = random.getrandbits(64)
+        self._zobrist_side[1] = random.getrandbits(64)
+
+    def _zobrist_hash(self, state: GameStateHex) -> int:
+        """Calcule le hash Zobrist de l'état"""
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        h = 0
+        for (i, j), piece in env.items():
+            try:
+                pt = piece.get_type()
+                h ^= self._zobrist_table[(pt, i, j)]
+            except Exception:
+                pass
+        # XOR avec le joueur courant
+        player_idx = 0 if state.next_player.get_id() == state.players[0].get_id() else 1
+        h ^= self._zobrist_side[player_idx]
+        return h
 
     def compute_action(self, current_state: GameState, remaining_time: int = 1_000_000_000, **kwargs) -> Action:  # type: ignore[override]
-        """
-        Sélectionne une action via Minimax alpha-bêta avec profondeur limitée et heuristique basique.
-        """
-        # Compteurs et horloge
+        """Sélectionne une action via IDS + alpha-bêta avec toutes les optimisations"""
         start = time.perf_counter()
         self._nodes_visited = 0
         self._depth_reached = 0
-
-        # Budget temps par coup (soft): 2% du temps restant, borné [0.2s, 0.75s]
+        self._tt.clear()  # Clear TT chaque coup (ou garder si mémoire suffisante)
+        
+        # Budget temps: 2% du temps restant, borné [0.3s, 1.5s]
         try:
             rt = float(remaining_time)
         except Exception:
             rt = 900.0
-        per_move_budget = min(0.75, max(0.2, 0.02 * rt))
+        per_move_budget = min(1.5, max(0.3, 0.02 * rt))
         self._deadline = start + per_move_budget
-
-        state: GameState = current_state
+        
+        state = current_state
         st_hex = cast(GameStateHex, state)
+        rep_board = cast(BoardHex, st_hex.get_rep())
+        env = rep_board.get_env()
+        n = rep_board.get_dimensions()[0]
+        
+        # Déduire le dernier coup adverse
+        curr_pos_set = set(env.keys())
+        last_pos = self._deduce_last_opponent_move(st_hex, curr_pos_set)
+        
+        # Log du dernier coup
+        if last_pos:
+            print(f"[MyPlayer] last_opp={self._pos_to_an(last_pos, n)}")
+
+        # Ouverture forcée temporaire: jouer L6 à NOTRE premier coup (même si l'adversaire a déjà joué)
+        # L6 => (i,j) = (5,11) en notation interne (0-index)
+        try:
+            my_type = self.piece_type
+            my_count = sum(1 for p in env.values() if p.get_type() == my_type)
+        except Exception:
+            my_count = 0
+        if my_count == 0:
+            forced = (5, 11)
+            if env.get(forced) is None:
+                actions = list(state.get_possible_light_actions())
+                forced_cand = next((a for a in actions if a.data.get("position") == forced), None)
+                if forced_cand:
+                    print("[MyPlayer] forced_open=L6")
+                    self._update_prev_positions(curr_pos_set, forced_cand)
+                    return forced_cand
+        
+        # PHASE 1: Must-block (gagne en 1 coup)
+        threats = self._must_block_cells(st_hex)
+        if threats:
+            actions = list(state.get_possible_light_actions())
+            candidates = [a for a in actions if a.data.get("position") in threats]
+            if candidates:
+                best_block = self._choose_best_from_candidates(st_hex, candidates)
+                if best_block:
+                    print(f"[MyPlayer] must_block size={len(candidates)}")
+                    self._update_prev_positions(curr_pos_set, best_block)
+                    return best_block
+        
+        # PHASE 2: Bridge réactif
+        replies = self._bridge_intrusion_replies(st_hex, self.piece_type, last_pos)
+        if replies:
+            actions = list(state.get_possible_light_actions())
+            best_bridge = self._handle_bridge_replies(st_hex, replies, actions)
+            if best_bridge:
+                self._update_prev_positions(curr_pos_set, best_bridge)
+                return best_bridge
+        
+        # PHASE 3: Ziggurat - réponse aux intrusions dans nos templates
+        print(f"[MyPlayer] ziggurat_phase start last_opp={self._pos_to_an(last_pos, n) if last_pos else 'None'}")
+        ziggurat_response = self._ziggurat_intrusion_response(st_hex, self.piece_type, last_pos)
+        if ziggurat_response:
+            actions = list(state.get_possible_light_actions())
+            candidates = [a for a in actions if a.data.get("position") == ziggurat_response]
+            if candidates:
+                best_zig = candidates[0]
+                print(f"[MyPlayer] ziggurat_response={self._pos_to_an(ziggurat_response, n)}")
+                self._update_prev_positions(curr_pos_set, best_zig)
+                return best_zig
+        else:
+            print("[MyPlayer] ziggurat_phase no_response")
+
+        # PHASE 4: Edge reduce (réduction 2→1 vers bord)
+        edge21_moves = self._edge_reduce_rank2_to_rank1_for_player(st_hex, self.piece_type)
+        if edge21_moves:
+            actions = list(state.get_possible_light_actions())
+            candidates = [a for a in actions if a.data.get("position") in edge21_moves]
+            if candidates:
+                best_edge21 = self._choose_best_from_candidates(st_hex, candidates)
+                if best_edge21:
+                    pos = best_edge21.data.get("position")
+                    if isinstance(pos, tuple):
+                        print(f"[MyPlayer] edge_reduce_2to1={self._pos_to_an(pos, n)}")
+                    self._update_prev_positions(curr_pos_set, best_edge21)
+                    return best_edge21
+
+        # PHASE 5: Edge reduce (réduction 3→2)
+        edge_moves = self._edge_reduce_for_player(st_hex, self.piece_type)
+        if edge_moves:
+            actions = list(state.get_possible_light_actions())
+            candidates = [a for a in actions if a.data.get("position") in edge_moves]
+            if candidates:
+                best_edge = self._choose_best_from_candidates(st_hex, candidates)
+                if best_edge:
+                    pos = best_edge.data.get("position")
+                    if isinstance(pos, tuple):
+                        print(f"[MyPlayer] edge_reduce_3to2={self._pos_to_an(pos, n)}")
+                    self._update_prev_positions(curr_pos_set, best_edge)
+                    return best_edge
+
+        # PHASE 6: Edge double-threat (rang 2 → 2 gagnants en rang 1)
+        edge_threats = self._edge_double_threat_from_last_move(st_hex, last_pos)
+        if edge_threats:
+            actions = list(state.get_possible_light_actions())
+            candidates = [a for a in actions if a.data.get("position") in edge_threats]
+            if candidates:
+                best_et = self._choose_best_from_candidates(st_hex, candidates)
+                if best_et:
+                    print(f"[MyPlayer] edge_double_threat size={len(candidates)}")
+                    self._update_prev_positions(curr_pos_set, best_et)
+                    return best_et
+
+        # PHASE 6: IDS + Alpha-bêta avec toutes les optimisations
+        best_action = self._iterative_deepening_search(st_hex, last_pos)
+        
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        print(f"[MyPlayer] nodes={self._nodes_visited} time_ms={elapsed_ms:.1f} depth={self._depth_reached}")
+        
+        self._update_prev_positions(curr_pos_set, best_action)
+        return best_action
+
+    def _iterative_deepening_search(self, state: GameStateHex, last_pos: Optional[tuple[int,int]]) -> LightAction:
+        """IDS: recherche itérative en profondeur croissante"""
         actions = list(state.get_possible_light_actions())
         if not actions:
             raise RuntimeError("Aucune action légale disponible.")
-        # Déduire la dernière position jouée (adverse) via comparaison d’état
-        rep_board = cast(BoardHex, st_hex.get_rep())
-        env = rep_board.get_env()
-        curr_pos_set = set(env.keys())
-        last_pos: Optional[tuple[int, int]] = None
+        
+        # Filtrage dead cells (P6)
+        filtered_actions = self._filter_dead_cells(state, actions, last_pos)
+        if not filtered_actions:
+            filtered_actions = actions
+        
+        # Ordonnancement initial
+        ordered_actions = self._order_actions_with_spine(state, filtered_actions, last_pos)
+        
+        best_action = ordered_actions[0]
+        best_value = float("-inf")
+        
+        # IDS: profondeur croissante
+        for depth in range(1, self.max_depth + 1):
+            if time.perf_counter() >= self._deadline:
+                break
+            
+            self._depth_reached = depth
+            temp_best = None
+            temp_value = float("-inf")
+            alpha, beta = float("-inf"), float("inf")
+            
+            # Réordonner avec le meilleur coup du palier précédent en tête
+            if best_action and best_action in ordered_actions:
+                ordered_actions.remove(best_action)
+                ordered_actions.insert(0, best_action)
+            
+            for action in ordered_actions:
+                if time.perf_counter() >= self._deadline:
+                    break
+                
+                child = cast(GameStateHex, state.apply_action(action))
+                value = self._alphabeta(child, depth - 1, alpha, beta, False)
+                
+                if value > temp_value:
+                    temp_value = value
+                    temp_best = action
+                
+                alpha = max(alpha, temp_value)
+                if alpha >= beta:
+                    break
+            
+            if temp_best is not None:
+                best_action = temp_best
+                best_value = temp_value
+        
+        return best_action
+
+    def _alphabeta(self, state: GameStateHex, depth: int, alpha: float, beta: float, maximizing: bool) -> float:
+        """Alpha-bêta avec table de transposition et quiescence"""
+        if time.perf_counter() > self._deadline:
+            return self._fast_static_eval(state)
+        
+        self._nodes_visited += 1
+        
+        # Vérifier TT
+        zh = self._zobrist_hash(state)
+        if zh in self._tt:
+            tt_value, tt_depth, tt_flag, _ = self._tt[zh]
+            if tt_depth >= depth:
+                if tt_flag == "EXACT":
+                    return tt_value
+                elif tt_flag == "LOWER" and tt_value >= beta:
+                    return tt_value
+                elif tt_flag == "UPPER" and tt_value <= alpha:
+                    return tt_value
+        
+        # Terminal
+        if state.is_done():
+            return float(self._utility(state))
+        
+        # Coupe
+        if depth <= 0:
+            # Quiescence simple: si le dernier coup était une intrusion tactique, prolonger d'1
+            return float(self._evaluate(state))
+        
+        my_turn = (state.next_player.get_id() == self.get_id())
+        actions = list(state.get_possible_light_actions())
+        
+        # Ordonnancement en profondeur (simplifié)
+        ordered_actions = self._order_actions_simple(state, actions)
+        
+        if maximizing or my_turn:
+            value = float("-inf")
+            best_move = None
+            for action in ordered_actions:
+                child = cast(GameStateHex, state.apply_action(action))
+                child_value = self._alphabeta(child, depth - 1, alpha, beta, False)
+                if child_value > value:
+                    value = child_value
+                    best_move = action.data.get("position")
+                alpha = max(alpha, value)
+                if alpha >= beta:
+                    break
+            
+            # Stocker dans TT
+            flag = "EXACT" if value > alpha and value < beta else ("LOWER" if value >= beta else "UPPER")
+            self._tt[zh] = (value, depth, flag, best_move)
+            return value
+        else:
+            value = float("inf")
+            best_move = None
+            for action in ordered_actions:
+                child = cast(GameStateHex, state.apply_action(action))
+                child_value = self._alphabeta(child, depth - 1, alpha, beta, True)
+                if child_value < value:
+                    value = child_value
+                    best_move = action.data.get("position")
+                beta = min(beta, value)
+                if alpha >= beta:
+                    break
+            
+            flag = "EXACT" if value > alpha and value < beta else ("UPPER" if value <= alpha else "LOWER")
+            self._tt[zh] = (value, depth, flag, best_move)
+            return value
+
+    def _filter_dead_cells(self, state: GameStateHex, actions: list[LightAction], last_pos: Optional[tuple[int,int]]) -> list[LightAction]:
+        """P6: Filtrage des coups morts (coins, zones scellées)"""
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+        
+        # Conserver les coups tactiques
+        threats = self._must_block_cells(state)
+        opp_type = "B" if self.piece_type == "R" else "R"
+        opp_bridge_holes = self._bridge_holes(state, opp_type)
+        my_bridge_holes = self._bridge_holes(state, self.piece_type)
+        
+        curr_dist = self._connection_distance(state, self.piece_type)
+        opp_dist = self._connection_distance(state, opp_type)
+        
+        filtered = []
+        for a in actions:
+            pos = a.data.get("position")
+            if not (isinstance(pos, tuple) and len(pos) == 2):
+                continue
+            
+            i, j = pos
+            
+            # Garder si tactique
+            if pos in threats or pos in opp_bridge_holes or pos in my_bridge_holes:
+                filtered.append(a)
+                continue
+            
+            # Garder si zone centrale (pas dans les coins extrêmes)
+            if 2 <= i < n-2 and 2 <= j < n-2:
+                filtered.append(a)
+                continue
+            
+            # Garder si améliore notre distance ou dégrade la leur
+            child = cast(GameStateHex, state.apply_action(a))
+            new_my_dist = self._connection_distance(child, self.piece_type)
+            new_opp_dist = self._connection_distance(child, opp_type)
+            
+            if new_my_dist < curr_dist or new_opp_dist > opp_dist:
+                filtered.append(a)
+                continue
+        
+        return filtered if filtered else actions
+
+    def _order_actions_with_spine(self, state: GameStateHex, actions: list[LightAction], last_pos: Optional[tuple[int,int]]) -> list[LightAction]:
+        """P3.2: Ordonnancement avec épine dorsale, bridges, gradient"""
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+        
+        # Calcul de l'épine dorsale
+        spine = self._guiding_spine(state, self.piece_type)
+        
+        # Pré-calculs
+        opp_type = "B" if self.piece_type == "R" else "R"
+        opp_bridge_holes = self._bridge_holes(state, opp_type)
+        curr_dist = self._connection_distance(state, self.piece_type)
+        border_reduce = self._border_reduce_candidates_from_actions(state, self.piece_type, curr_dist, actions)
+        
+        # Score chaque action
+        scored = []
+        for a in actions:
+            pos = a.data.get("position")
+            if not (isinstance(pos, tuple) and len(pos) == 2):
+                continue
+            
+            # Éval de base
+            child = cast(GameStateHex, state.apply_action(a))
+            score = self._root_order_score(child)
+            
+            # Bonus épine + bridges + gradient (P3.2)
+            spine_bonus = self._bridge_guided_bonus(state, pos, spine)
+            score += spine_bonus
+            
+            # Bonus adjacence
+            adj = self._friendly_neighbors_count(state, pos, self.piece_type)
+            score += 0.18 * (adj / 6.0)
+            
+            # Bonus réduction bord
+            if pos in border_reduce:
+                score += 0.12
+            
+            # Bonus si création/complétion d'un ziggurat
+            zig_bonus = self._ziggurat_formation_bonus(state, pos)
+            score += zig_bonus
+            
+            # Bonus biais de flanc
+            if last_pos:
+                if self.piece_type == "B":
+                    if (last_pos[1] <= 1 and pos[1] == 1) or (last_pos[1] >= n-2 and pos[1] == n-2):
+                        score += 0.06
+                else:
+                    if (last_pos[0] <= 1 and pos[0] == 1) or (last_pos[0] >= n-2 and pos[0] == n-2):
+                        score += 0.06
+            
+            # Pénalité trous adverses (sauf si tactique)
+            if pos in opp_bridge_holes:
+                child_tmp = cast(GameStateHex, state.apply_action(a))
+                if self._utility(child_tmp) != 1:
+                    score -= 0.12
+            
+            scored.append((a, score))
+        
+        scored.sort(key=lambda t: t[1], reverse=True)
+        return [a for a, _ in scored]
+
+    def _order_actions_simple(self, state: GameStateHex, actions: list[LightAction]) -> list[LightAction]:
+        """Ordonnancement simplifié pour les niveaux profonds"""
+        scored = []
+        for a in actions:
+            child = cast(GameStateHex, state.apply_action(a))
+            score = self._fast_static_eval(child)
+            scored.append((a, score))
+        scored.sort(key=lambda t: t[1], reverse=True)
+        return [a for a, _ in scored]
+
+    # ========== HELPERS TACTIQUES ==========
+
+    def _deduce_last_opponent_move(self, state: GameStateHex, curr_pos_set: set[tuple[int,int]]) -> Optional[tuple[int,int]]:
+        """Déduit le dernier coup adverse par différence d'états"""
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        
         try:
             prev = getattr(self, "_prev_positions", set())
             added_list = list(curr_pos_set - prev)
-            opp_type_now = "B" if self.piece_type == "R" else "R"
-            # Accès robuste au type
-            def _ptype_at(pos: tuple[int,int]):
+            opp_type = "B" if self.piece_type == "R" else "R"
+            
+            opp_added = []
+            for pos in added_list:
                 p = env.get(pos)
-                if p is None:
-                    return None
-                try:
-                    return p.get_type()
-                except Exception:
-                    return getattr(p, "piece_type", None)
-            opp_added = [pos for pos in added_list if _ptype_at(pos) == opp_type_now]
-
+                if p is not None and p.get_type() == opp_type:
+                    opp_added.append(pos)
+            
             if len(opp_added) == 1:
-                last_pos = opp_added[0]
+                return opp_added[0]
             elif len(opp_added) > 1:
-                # Ambiguïté rare: garder la première (mieux que None; on loggue le détail)
-                last_pos = opp_added[0]
-            else:
-                # Aucun ajout adverse détecté; laisser last_pos=None mais tracer le delta complet
-                last_pos = None
-
-            # Traces détaillées pour diagnostic
-            try:
-                n_dim = rep_board.get_dimensions()[0]
-                def fmt_list(L):
-                    return "[" + ",".join(self._pos_to_an(p, n_dim) for p in L) + "]"
-                print(f"[MyPlayer] added={fmt_list(added_list)} opp_added={fmt_list(opp_added)}")
-            except Exception:
-                pass
-        except Exception:
-            last_pos = None
-        # Log du dernier coup adverse déduit
-        try:
-            n_dim = rep_board.get_dimensions()[0]
-            if last_pos is not None:
-                print(f"[MyPlayer] last_opp={self._pos_to_an(last_pos, n_dim)}")
-            else:
-                print("[MyPlayer] last_opp=?")
+                return opp_added[0]
         except Exception:
             pass
+        return None
 
-        # Must-block: si l'adversaire gagne en 1 coup, bloquer immédiatement
-        threats = self._must_block_cells(st_hex)
-        if threats:
-            candidates = [a for a in actions if a.data.get("position") in threats]
-            if candidates:
-                best_block: Optional[LightAction] = None
-                best_val = float("-inf")
-                for a in candidates:
-                    child_b = cast(GameStateHex, st_hex.apply_action(a))
-                    v = self._fast_static_eval(child_b)
-                    if v > best_val:
-                        best_val = v
-                        best_block = a
-                if best_block is not None:
-                    try:
-                        print(f"[MyPlayer] must_block size={len(candidates)}")
-                    except Exception:
-                        pass
-                    # Mettre à jour le snapshot en y ajoutant notre coup choisi
-                    try:
-                        pos_played = best_block.data.get("position")
-                        if isinstance(pos_played, tuple) and len(pos_played) == 2:
-                            self._prev_positions = set(curr_pos_set)
-                            self._prev_positions.add(pos_played)
-                    except Exception:
-                        pass
-                    return best_block
-
-        # Bridge réactif uniquement: si l'adversaire vient d'occuper un des deux trous d'un de nos ponts,
-        # jouer l'autre trou immédiatement (ne pas remplir nos ponts proactivement).
-        replies = self._bridge_intrusion_replies(st_hex, self.piece_type, last_pos)
-        if replies:
-            d_now = self._connection_distance(st_hex, self.piece_type)
-            reply_positions = {rp for (rp, _, _, _) in replies}
-            bridge_candidates = [a for a in actions if a.data.get("position") in reply_positions]
-            best_bridge: Optional[LightAction] = None
-            best_info: Optional[tuple[tuple[int,int], tuple[int,int], tuple[int,int], tuple[int,int]]] = None
-            best_val = float("-inf")
-            for a in bridge_candidates:
-                child_b = cast(GameStateHex, st_hex.apply_action(a))
-                # Par sécurité, ne joue que si cela ne dégrade pas la distance de connexion
-                if self._connection_distance(child_b, self.piece_type) <= d_now:
-                    v = self._fast_static_eval(child_b)
-                    if v > best_val:
-                        best_val = v
-                        best_bridge = a
-                        # associer l'info correspondante
-                        pos = a.data.get("position")
-                        for info in replies:
-                            if info[0] == pos:
-                                best_info = info
-                                break
-            if best_bridge is not None:
-                # Log explicite de la détection
-                try:
-                    if best_info is not None:
-                        rp, a1, a2, intr = best_info
-                        n_dim = rep_board.get_dimensions()[0]
-                        rp_s   = self._pos_to_an(rp, n_dim)
-                        a1_s   = self._pos_to_an(a1, n_dim)
-                        a2_s   = self._pos_to_an(a2, n_dim)
-                        intr_s = self._pos_to_an(intr, n_dim)
-                        print(f"[MyPlayer] bridge_intrusion allies={a1_s},{a2_s} intruder={intr_s} reply={rp_s}")
-                    else:
-                        print("[MyPlayer] bridge_intrusion reply chosen")
-                except Exception:
-                    pass
-                # Mettre à jour le snapshot en y ajoutant notre coup choisi
-                try:
-                    pos_played = best_bridge.data.get("position")
-                    if isinstance(pos_played, tuple) and len(pos_played) == 2:
-                        self._prev_positions = set(curr_pos_set)
-                        self._prev_positions.add(pos_played)
-                except Exception:
-                    pass
-                return best_bridge
-
-        best_action: Optional[LightAction] = None
-        best_value = float("-inf")
-        alpha, beta = float("-inf"), float("inf")
-
-        # Tri en deux étages pour limiter le coût (distance seulement sur top_k)
-        base_scored = []
-        for a in actions:
-            child_tmp = cast(GameStateHex, st_hex.apply_action(a))
-            base_scored.append((a, self._fast_static_eval(child_tmp)))
-        # Tri initial par éval rapide
-        base_scored.sort(key=lambda t: t[1], reverse=True)
-        # Pré-calcul: trous de pont de l'adversaire (éviter d'y jouer sans nécessité)
-        opp_type = "B" if self.piece_type == "R" else "R"
-        opp_bridge_holes_all = self._bridge_holes(st_hex, opp_type)
-
-        # Pré-calcul: candidats de réduction bord (rangée/colonne 2) qui réduisent la distance de connexion
-        curr_dist_conn = self._connection_distance(st_hex, self.piece_type)
-        border_reduce_candidates = self._border_reduce_candidates_from_actions(st_hex, self.piece_type, curr_dist_conn, actions)
+    def _update_prev_positions(self, curr_pos_set: set[tuple[int,int]], action: LightAction):
+        """Met à jour le snapshot de positions après notre coup"""
         try:
-            n_dim = rep_board.get_dimensions()[0]
-            br_list = ",".join(self._pos_to_an(p, n_dim) for p in border_reduce_candidates)
-            print(f"[MyPlayer] border_candidates=[{br_list}]")
-        except Exception:
-            pass
-
-        # Affinage sur un sous-ensemble (top_k) avec distance; borne temps ~ min(0.25 s, 1/3 du budget)
-        refined = []
-        # Debug ordonnancement: (posAN, base, final, used_stage2, adj_bonus, bh_penalty)
-        order_debug: list[tuple[str, float, float, bool, float, bool]] = []
-        n_dim = rep_board.get_dimensions()[0]
-        start_order = time.perf_counter()
-        top_k = min(16, max(6, len(base_scored) // 5))
-        order_time_cap = min(0.25, max(0.08, (self._deadline - start) / 3.0))
-        for idx, (a, base_val) in enumerate(base_scored):
-            child_for_penalty: Optional[GameStateHex] = None
-            pos = a.data.get("position")
-            used_stage2 = False
-            adj_bonus = 0.0
-            if idx < top_k and (time.perf_counter() - start_order) < order_time_cap:
-                child_top = cast(GameStateHex, st_hex.apply_action(a))
-                score = self._root_order_score(child_top)
-                child_for_penalty = child_top
-                used_stage2 = True
-                # Petit bonus d'adjacence locale (évite l'isolement complet)
-                if isinstance(pos, tuple) and len(pos) == 2:
-                    adj = self._friendly_neighbors_count(st_hex, cast(tuple[int,int], pos), self.piece_type)
-                    adj_bonus = 0.08 * (adj / 6.0)
-                    score += adj_bonus
-            else:
-                score = base_val
-            # Micro-biais de flanc: si le dernier coup adverse est sur/près d'un bord,
-            # privilégier l'anneau 2 du MÊME flanc (colonne 1 ou n-2 pour Bleu, ligne 1 ou n-2 pour Rouge)
-            if isinstance(pos, tuple) and len(pos) == 2 and last_pos is not None:
-                n_side = n_dim
-                if self.piece_type == "B":
-                    if last_pos[1] <= 1 and pos[1] == 1:
-                        score += 0.06
-                    elif last_pos[1] >= n_side - 2 and pos[1] == n_side - 2:
-                        score += 0.06
-                else:
-                    if last_pos[0] <= 1 and pos[0] == 1:
-                        score += 0.06
-                    elif last_pos[0] >= n_side - 2 and pos[0] == n_side - 2:
-                        score += 0.06
-            # Bonus léger si coup de réduction bord détecté
-            if isinstance(pos, tuple) and len(pos) == 2 and pos in border_reduce_candidates:
-                score += 0.12
-            # Pénalité légère si on joue dans un trou de pont adverse (sauf blocage ou gain immédiat)
-            bh_penalty = False
-            if isinstance(pos, tuple) and len(pos) == 2 and pos in opp_bridge_holes_all and (pos not in threats):
-                if child_for_penalty is None:
-                    child_for_penalty = cast(GameStateHex, st_hex.apply_action(a))
-                if self._utility(child_for_penalty) != 1:
-                    score -= 0.12
-                    bh_penalty = True
-            refined.append((a, score))
-            # Enregistrer debug pour ce coup
-            try:
-                pos_s = self._pos_to_an(pos, n_dim) if isinstance(pos, tuple) and len(pos) == 2 else "?"
-                order_debug.append((pos_s, float(base_val), float(score), used_stage2, float(adj_bonus), bh_penalty))
-            except Exception:
-                pass
-
-        spent_ms = (time.perf_counter() - start_order) * 1000.0
-        refined.sort(key=lambda t: t[1], reverse=True)
-        actions = [a for (a, _) in refined]
-
-        # Résumés d’ordonnancement
-        try:
-            print(f"[MyPlayer] order n={len(base_scored)} top_k={top_k} cap_ms={order_time_cap*1000:.1f} spent_ms={spent_ms:.1f}")
-            dbg_map = {d[0]: d for d in order_debug}
-            top_list = []
-            for a, sc in refined[:5]:
-                p = a.data.get("position")
-                key = self._pos_to_an(p, n_dim) if isinstance(p, tuple) and len(p) == 2 else "?"
-                d = dbg_map.get(key)
-                flags = ""
-                if d:
-                    _, _, _, used_r2, adj_b, pen = d
-                    if used_r2: flags += "*r2"
-                    if adj_b > 0.0: flags += "+adj"
-                    if pen: flags += "-bh"
-                # Marquer bonus réduction bord
-                if isinstance(p, tuple) and len(p) == 2 and p in border_reduce_candidates:
-                    flags += "+br"
-                # Marquer biais de flanc si applicable
-                if isinstance(p, tuple) and len(p) == 2 and last_pos is not None:
-                    if self.piece_type == "B":
-                        if (last_pos[1] <= 1 and p[1] == 1) or (last_pos[1] >= n_dim - 2 and p[1] == n_dim - 2):
-                            flags += "+fl"
-                    else:
-                        if (last_pos[0] <= 1 and p[0] == 1) or (last_pos[0] >= n_dim - 2 and p[0] == n_dim - 2):
-                            flags += "+fl"
-                top_list.append(f"{key}:{sc:.3f}{flags}")
-            print(f"[MyPlayer] order_top5={','.join(top_list)}")
-        except Exception:
-            pass
-
-        for action in actions:
-            child = cast(GameStateHex, st_hex.apply_action(action))
-            value = self._alphabeta(child, depth=self.max_depth - 1, alpha=alpha, beta=beta)
-            if value > best_value:
-                best_value = value
-                best_action = action
-            alpha = max(alpha, best_value)
-            if alpha >= beta:
-                break
-
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        self._last_stats = {
-            "nodes": self._nodes_visited,
-            "elapsed_ms": elapsed_ms,
-            "depth_reached": self._depth_reached,
-        }
-        try:
-            print(f"[MyPlayer] nodes={self._last_stats['nodes']} time_ms={self._last_stats['elapsed_ms']:.1f} depth={self._last_stats['depth_reached']}")
-        except Exception:
-            pass
-        # Choix final
-        chosen = best_action if best_action is not None else actions[0]
-        # Log si le coup choisi est une réduction bord
-        try:
-            pos_ch = chosen.data.get("position")
-            if isinstance(pos_ch, tuple) and len(pos_ch) == 2:
-                if pos_ch in border_reduce_candidates:
-                    n_dim = rep_board.get_dimensions()[0]
-                    print(f"[MyPlayer] border_reduce={self._pos_to_an(pos_ch, n_dim)}")
-        except Exception:
-            pass
-        # Mémoriser l’état APRÈS notre coup pour déduire exactement le prochain last_opp
-        try:
-            pos_played = chosen.data.get("position")
-            if isinstance(pos_played, tuple) and len(pos_played) == 2:
+            pos = action.data.get("position")
+            if isinstance(pos, tuple) and len(pos) == 2:
                 snap = set(curr_pos_set)
-                snap.add(pos_played)
+                snap.add(pos)
                 self._prev_positions = snap
             else:
                 self._prev_positions = curr_pos_set
         except Exception:
             self._prev_positions = curr_pos_set
-        return chosen
 
-    def _alphabeta(self, state: GameStateHex, depth: int, alpha: float, beta: float) -> float:
-        # Garde temps: si deadline dépassée, retourne une éval rapide (coupe soft)
-        if time.perf_counter() > self._deadline:
-            return self._fast_static_eval(state)
+    def _must_block_cells(self, state: GameStateHex) -> set[tuple[int, int]]:
+        """Cases où l'adversaire gagne en 1 coup"""
+        rep = cast(BoardHex, state.get_rep())
+        opp = self._find_opponent(state)
+        opp_type = "B" if self.piece_type == "R" else "R"
+        threats = set()
+        for pos in rep.get_empty():
+            scores = state.compute_scores((pos, opp_type, opp.get_id()))
+            if scores.get(opp.get_id(), 0) == 1:
+                threats.add(pos)
+        return threats
 
-        self._nodes_visited += 1
-        # Mettre à jour la profondeur atteinte (à partir de la racine)
-        try:
-            reached = self.max_depth - depth
-            if reached > self._depth_reached:
-                self._depth_reached = reached
-        except Exception:
-            pass
-        # Terminal exact
-        if state.is_done():
-            return float(self._utility(state))
+    def _edge_reduce_for_player(self, state: GameStateHex, piece_type: str) -> set[tuple[int,int]]:
+        """P5: Détection template 3→2 (réduction de bord)"""
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+        
+        edge_moves = set()
+        d0 = self._connection_distance(state, piece_type)
 
-        # Coupe: renvoie heuristique
-        if depth <= 0:
-            return float(self._evaluate(state))
+        # Helper: la composante contenant (i,j) touche-t-elle un bord donné ?
+        def component_touches_side(start: tuple[int,int], side: str) -> bool:
+            sp = env.get(start)
+            try:
+                if sp is None or sp.get_type() != piece_type:
+                    return False
+            except Exception:
+                return False
+            stack = [start]
+            visited: set[tuple[int,int]] = {start}
+            while stack:
+                ci, cj = stack.pop()
+                if side == "TOP" and ci == 0:
+                    return True
+                if side == "BOTTOM" and ci == n - 1:
+                    return True
+                if side == "LEFT" and cj == 0:
+                    return True
+                if side == "RIGHT" and cj == n - 1:
+                    return True
+                for n_type, (ni, nj) in state.get_neighbours(ci, cj).values():
+                    if n_type == piece_type and (ni, nj) not in visited:
+                        visited.add((ni, nj))
+                        stack.append((ni, nj))
+            return False
+        
+        # Chercher pierres en rang 3 (tous bords)
+        for (i, j), p in env.items():
+            try:
+                if p.get_type() != piece_type:
+                    continue
+            except:
+                continue
 
-        my_turn = (state.next_player.get_id() == self.get_id())
+            candidates: list[tuple[int,int]] = []
 
-        if my_turn:
-            value = float("-inf")
-            for action in state.get_possible_light_actions():
+            if piece_type == "R":
+                # Haut: i==2 -> pousser vers i==1, rejeter si déjà connecté au TOP
+                if i == 2:
+                    if component_touches_side((i, j), "TOP"):
+                        continue
+                    candidates.extend([(1, j), (1, j-1), (1, j+1)])
+                # Bas: i==n-3 -> pousser vers i==n-2, rejeter si déjà connecté au BOTTOM
+                if i == n - 3:
+                    if component_touches_side((i, j), "BOTTOM"):
+                        continue
+                    candidates.extend([(n - 2, j), (n - 2, j-1), (n - 2, j+1)])
+            else:  # Bleu
+                # Gauche: j==2 -> pousser vers j==1, rejeter si déjà connecté au LEFT
+                if j == 2:
+                    if component_touches_side((i, j), "LEFT"):
+                        continue
+                    candidates.extend([(i, 1), (i-1, 1), (i+1, 1)])
+                # Droite: j==n-3 -> pousser vers j==n-2, rejeter si déjà connecté au RIGHT
+                if j == n - 3:
+                    if component_touches_side((i, j), "RIGHT"):
+                        continue
+                    candidates.extend([(i, n - 2), (i-1, n - 2), (i+1, n - 2)])
+
+            if not candidates:
+                continue
+            
+            for cand in candidates:
+                ci, cj = cand
+                if not (0 <= ci < n and 0 <= cj < n):
+                    continue
+                if env.get(cand) is not None:
+                    continue
+                
+                # Vérifier que ça ne dégrade pas la distance de connexion
+                action = LightAction({"piece": piece_type, "position": cand})
                 child = cast(GameStateHex, state.apply_action(action))
-                value = max(value, self._alphabeta(child, depth - 1, alpha, beta))
-                alpha = max(alpha, value)
-                if alpha >= beta:
-                    break
-            return value
+                d1 = self._connection_distance(child, piece_type)
+                if d1 <= d0:
+                    edge_moves.add(cand)
+        
+        return edge_moves
+
+    def _edge_reduce_rank2_to_rank1_for_player(self, state: GameStateHex, piece_type: str) -> set[tuple[int,int]]:
+        """P5: Réduction de bord 2→1.
+        Ne déclenche que si la composante alliée contenant le pion de rang 2 ne touche pas déjà
+        le bord cible concerné par la poussée (TOP/BOTTOM pour R, LEFT/RIGHT pour B).
+        Couvre les deux côtés: i==1 et i==n-2 (R), j==1 et j==n-2 (B).
+        """
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+
+        edge_moves: set[tuple[int,int]] = set()
+        d0 = self._connection_distance(state, piece_type)
+
+        # Helper local: BFS sur la composante alliée et test côté
+        def component_touches_side(start: tuple[int,int], side: str) -> bool:
+            sp = env.get(start)
+            try:
+                if sp is None or sp.get_type() != piece_type:
+                    return False
+            except Exception:
+                return False
+            stack = [start]
+            visited: set[tuple[int,int]] = {start}
+            while stack:
+                ci, cj = stack.pop()
+                if side == "TOP" and ci == 0:
+                    return True
+                if side == "BOTTOM" and ci == n - 1:
+                    return True
+                if side == "LEFT" and cj == 0:
+                    return True
+                if side == "RIGHT" and cj == n - 1:
+                    return True
+                for n_type, (ni, nj) in state.get_neighbours(ci, cj).values():
+                    if n_type == piece_type and (ni, nj) not in visited:
+                        visited.add((ni, nj))
+                        stack.append((ni, nj))
+            return False
+
+        def component_nodes(start: tuple[int,int]) -> set[tuple[int,int]]:
+            sp = env.get(start)
+            try:
+                if sp is None or sp.get_type() != piece_type:
+                    return set()
+            except Exception:
+                return set()
+            stack = [start]
+            visited: set[tuple[int,int]] = {start}
+            while stack:
+                ci, cj = stack.pop()
+                for n_type, (ni, nj) in state.get_neighbours(ci, cj).values():
+                    if n_type == piece_type and (ni, nj) not in visited:
+                        visited.add((ni, nj))
+                        stack.append((ni, nj))
+            return visited
+
+        def adjacent_to_component(cand: tuple[int,int], comp: set[tuple[int,int]]) -> bool:
+            for _, (ni, nj) in state.get_neighbours(cand[0], cand[1]).values():
+                if (ni, nj) in comp:
+                    return True
+            return False
+
+        for (i, j), p in env.items():
+            try:
+                if p.get_type() != piece_type:
+                    continue
+            except Exception:
+                continue
+
+            cases: list[tuple[str, list[tuple[int,int]]]] = []
+
+            if piece_type == "R":
+                # Poussée vers TOP si en rang 2 haut: voisins de (i,j) sur i==0 sont (0,j) et (0,j+1)
+                if i == 1:
+                    cases.append(("TOP", [(0, j), (0, j+1)]))
+                # Poussée vers BOTTOM si en rang 2 bas: voisins sur i==n-1 sont (n-1,j) et (n-1,j-1)
+                if i == n - 2:
+                    cases.append(("BOTTOM", [(n-1, j), (n-1, j-1)]))
+            else:  # B
+                # Poussée vers LEFT si en rang 2 gauche: voisins sur j==0 sont (i,0) et (i+1,0)
+                if j == 1:
+                    cases.append(("LEFT", [(i, 0), (i+1, 0)]))
+                # Poussée vers RIGHT si en rang 2 droite: voisins sur j==n-1 sont (i,n-1) et (i-1,n-1)
+                if j == n - 2:
+                    cases.append(("RIGHT", [(i, n-1), (i-1, n-1)]))
+
+            if not cases:
+                continue
+
+            for side, candidates in cases:
+                # Ne rien proposer si la composante touche déjà ce bord
+                if component_touches_side((i, j), side):
+                    continue
+                # Composante alliée de référence (rang 2)
+                comp = component_nodes((i, j))
+
+                for cand in candidates:
+                    ci, cj = cand
+                    if not (0 <= ci < n and 0 <= cj < n):
+                        continue
+                    if env.get(cand) is not None:
+                        continue
+                    # Le coup doit être collé à la composante rang 2
+                    if not adjacent_to_component(cand, comp):
+                        continue
+
+                    # Garder si ça n'aggrave pas (idéalement réduit) la distance de connexion
+                    action = LightAction({"piece": piece_type, "position": cand})
+                    child = cast(GameStateHex, state.apply_action(action))
+                    d1 = self._connection_distance(child, piece_type)
+                    if d1 <= d0:
+                        edge_moves.add(cand)
+
+        return edge_moves
+
+    def _edge_double_threat_from_last_move(self, state: GameStateHex, last_pos: Optional[tuple[int,int]]) -> set[tuple[int,int]]:
+        """P5.b: Si adversaire en rang 2, bloquer les 2 gagnants en rang 1"""
+        if not last_pos:
+            return set()
+        
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+        
+        opp_type = "B" if self.piece_type == "R" else "R"
+        li, lj = last_pos
+        
+        # Vérifier que c'est bien une pierre adverse
+        p = env.get(last_pos)
+        if not p or p.get_type() != opp_type:
+            return set()
+        
+        # Vérifier si en rang 2
+        in_rank_2 = False
+        if opp_type == "R" and li == 1:
+            in_rank_2 = True
+        elif opp_type == "B" and lj == 1:
+            in_rank_2 = True
+        
+        if not in_rank_2:
+            return set()
+        
+        # Chercher les coups en rang 1 qui font gagner l'adversaire
+        opp = self._find_opponent(state)
+        rank_1_wins = set()
+        
+        if opp_type == "R":
+            # Rang 1 = i==0
+            for jj in range(max(0, lj-2), min(n, lj+3)):
+                pos = (0, jj)
+                if env.get(pos) is None:
+                    scores = state.compute_scores((pos, opp_type, opp.get_id()))
+                    if scores.get(opp.get_id(), 0) == 1:
+                        rank_1_wins.add(pos)
         else:
-            value = float("inf")
-            for action in state.get_possible_light_actions():
-                child = cast(GameStateHex, state.apply_action(action))
-                value = min(value, self._alphabeta(child, depth - 1, alpha, beta))
-                beta = min(beta, value)
-                if alpha >= beta:
+            # Rang 1 = j==0
+            for ii in range(max(0, li-2), min(n, li+3)):
+                pos = (ii, 0)
+                if env.get(pos) is None:
+                    scores = state.compute_scores((pos, opp_type, opp.get_id()))
+                    if scores.get(opp.get_id(), 0) == 1:
+                        rank_1_wins.add(pos)
+        
+        # Si 2+ menaces, retourner toutes
+        if len(rank_1_wins) >= 2:
+            return rank_1_wins
+        
+        return set()
+ 
+    # ========== ZIGGURAT TEMPLATE (P7+) ==========
+ 
+    def _ziggurat_specs_raw(self, state: GameStateHex, anchor: tuple[int,int], piece_type: str) -> Optional[dict]:
+        """
+        Gabarit brut (sans vérif des limites). Renvoie orientation, 9 positions (4-3-2) et escapes (A,B)
+        ou None si l'ancre n'est pas sur un rang admissible.
+        Règle bord: on décale le triangle pour rester in-bounds (évite j±3/i±3 hors plateau).
+        """
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+        i, j = anchor
+
+        orientation: Optional[str] = None
+        A: Optional[tuple[int,int]] = None
+        B: Optional[tuple[int,int]] = None
+
+        if piece_type == "B":
+            if j == 2:
+                # C-left: colonnes (j) 2, (j-1) 3, (j-2) 4. Escapes sur (j-1).
+                orientation = "B:C-left"
+                row2 = [(i, j), (i+1, j)]
+                row3 = [(i, j-1), (i+1, j-1), (i+2, j-1)]
+                row4 = [(i, j-2), (i+1, j-2), (i+2, j-2), (i+3, j-2)]
+                A, B = (i, j-1), (i+2, j-1)
+            elif j == n - 3:
+                # L-right: colonnes (j) 2, (j+1) 3, (j+2) 4. Escapes sur (j+1).
+                orientation = "B:L-right"
+                row2 = [(i-1, j), (i, j)]
+                row3 = [(i-2, j+1), (i-1, j+1), (i, j+1)]
+                row4 = [(i-3, j+2), (i-2, j+2), (i-1, j+2), (i, j+2)]
+                A, B = (i, j+1), (i-2, j+1)
+            else:
+                return None
+        else:
+            if i == 2:
+                # 3-up: lignes (i) 2, (i-1) 3, (i-2) 4. Escapes sur (i-1).
+                orientation = "R:3-up"
+                row2 = [(i, j), (i, j+1)]
+                row3 = [(i-1, j), (i-1, j+1), (i-1, j+2)]
+                row4 = [(i-2, j), (i-2, j+1), (i-2, j+2), (i-2, j+3)]
+                A, B = (i-1, j), (i-1, j+2)
+            elif i == n - 3:
+                # 12-down: lignes (i) 2, (i+1) 3, (i+2) 4. Escapes sur (i+1).
+                orientation = "R:12-down"
+                row2 = [(i, j-1), (i, j)]
+                row3 = [(i+1, j-2), (i+1, j-1), (i+1, j)]
+                row4 = [(i+2, j-3), (i+2, j-2), (i+2, j-1), (i+2, j)]
+                A, B = (i+1, j), (i+1, j-2)
+            else:
+                return None
+
+        rows = row2 + row3 + row4
+        return {"orientation": orientation, "carrier": rows, "escapes": (A, B)}
+
+    def _ziggurat_specs(self, state: GameStateHex, anchor: tuple[int,int], piece_type: str) -> Optional[dict]:
+        """
+        Spécifie un ziggurat valide (triangle 4-3-2 = 9 cases uniques) en vérifiant in-bounds.
+        """
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+
+        raw = self._ziggurat_specs_raw(state, anchor, piece_type)
+        if not raw:
+            return None
+
+        rows = raw["carrier"]
+        if len(rows) != 9 or len(set(rows)) != 9:
+            return None
+
+        for (ci, cj) in rows:
+            if not (0 <= ci < n and 0 <= cj < n):
+                return None
+
+        return raw
+ 
+    def _detect_ziggurat(self, state: GameStateHex, anchor: tuple[int,int], piece_type: str) -> bool:
+        """
+        Détection stricte d’un ziggurat selon specs (carrier entièrement vide).
+        Logs détaillés pour diagnostic.
+        """
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+        i, j = anchor
+ 
+        p = env.get(anchor)
+        if not p or p.get_type() != piece_type:
+            print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} fail=anchor_not_ally")
+            return False
+ 
+        spec = self._ziggurat_specs(state, anchor, piece_type)
+        if not spec:
+            print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} fail=no_specs")
+            return False
+ 
+        carrier = spec["carrier"]
+        A, B = spec["escapes"]
+        print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} orient={spec['orientation']} carrier_len={len(carrier)} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)})")
+        if len(carrier) != 9 or len(set(carrier)) != 9:
+            print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} fail=carrier_len_or_duplicates")
+            return False
+ 
+        ok = True
+        for (ci, cj) in carrier:
+            inb = (0 <= ci < n and 0 <= cj < n)
+            occ = env.get((ci, cj))
+            occ_t = None
+            try:
+                occ_t = occ.get_type() if occ is not None else None
+            except Exception:
+                occ_t = None
+            print(f"[MyPlayer][zig-detect] cell={self._pos_to_an((ci,cj), n) if inb else (ci,cj)} inb={inb} occ={'EMPTY' if occ_t is None else occ_t}")
+            if not inb:
+                ok = False
+            elif (ci, cj) != anchor and occ_t is not None:
+                ok = False
+        if not ok:
+            print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} result=blocked_or_oob")
+            return False
+ 
+        print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} result=valid")
+        return True
+ 
+    def _get_ziggurat_escape_cells(self, anchor: tuple[int,int], piece_type: str) -> tuple[tuple[int,int], tuple[int,int]]:
+        """
+        Retourne les deux cases A (bas-gauche) et B (bas-droite) pour un ziggurat.
+        Ces cases sont les sorties du template.
+        """
+        i, j = anchor
+        
+        if piece_type == "R":
+            # A = bas-gauche, B = bas-droite (relativement au mouvement vers le bas)
+            A = (i+1, j-1)
+            B = (i+1, j)
+        else:  # Bleu
+            # A = bas-gauche, B = bas-droite (relativement au mouvement vers la droite)
+            A = (i-1, j+1)
+            B = (i, j+1)
+        
+        return A, B
+ 
+    def _classify_ziggurat_intrusion(self, anchor: tuple[int,int], intruder: tuple[int,int], piece_type: str) -> str:
+        """
+        Détermine si l'intrusion est du côté gauche ou droit du ziggurat.
+        """
+        ai, aj = anchor
+        ii, ij = intruder
+        
+        if piece_type == "R":
+            # Pour Rouge (vertical), on compare les lignes
+            if ii < ai:
+                return "left"
+            else:
+                return "right"
+        else:  # Bleu
+            # Pour Bleu (horizontal), on compare les colonnes
+            if ij < aj:
+                return "left"
+            else:
+                return "right"
+ 
+    def _classify_zig_with_orient(self, anchor: tuple[int,int], intruder: tuple[int,int], orient: str) -> str:
+        ai, aj = anchor
+        ii, ij = intruder
+        # Offsets relatifs (di,dj) depuis l'ancre, dérivés des schémas fournis
+        masks = {
+            "B:L-right": {
+                "left": [(0, 1), (0, 2), (-1, 2)],
+                "right": [(-1, 0), (-1, 1), (-2, 1), (-2, 2), (-3, 2)],
+            },
+            "B:C-left": {
+                "left": [(0, -2), (0, -1), (1, -2)],
+                "right": [(1, 0), (1, -1), (2, -2), (2, -1), (3, -2)],
+            },
+            "R:12-down": {
+                "left": [(1, -1), (2, -2), (2, -1)],
+                "right": [(0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+            },
+            "R:3-up": {
+                "left": [(-2, 1), (-2, 2), (-1, 1)],
+                "right": [(-2, -1), (-2, 0), (-1, -1), (-1, 0), (0, -1)],
+            },
+        }
+        m = masks.get(orient)
+        if not m:
+            return "unknown"
+        di, dj = ii - ai, ij - aj
+        if (di, dj) in m["left"]:
+            return "left"
+        if (di, dj) in m["right"]:
+            return "right"
+        return "unknown"
+
+    def _ziggurat_intrusion_response(self, state: GameStateHex, piece_type: str, last_pos: Optional[tuple[int,int]]) -> Optional[tuple[int,int]]:
+        """
+        Réponse à une intrusion (toutes variantes). Tolère exactement 1 pierre adverse (last_pos) dans le carrier.
+        Ajoute des raisons explicites pour 'no_specs':
+         - not_allowed_anchor (rang invalide)
+         - out_of_bounds=[...]
+         - carrier_len=...
+         - duplicates=[...]
+         - not_empty=[...] (liste des cases qui bloquent, hors last_pos)
+         - last_pos_not_in_carrier / last_pos_not_opp
+        """
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+
+        if not last_pos:
+            print("[MyPlayer][zig] skip: no last_pos")
+            return None
+
+        print(f"[MyPlayer][zig] last_opp={self._pos_to_an(last_pos, n)} piece_type={piece_type}")
+        opp_type = "B" if piece_type == "R" else "R"
+        p = env.get(last_pos)
+        if not p or p.get_type() != opp_type:
+            print("[MyPlayer][zig] skip: last_pos not opponent piece")
+            return None
+
+        # Construire la liste des ancres admissibles par rang
+        anchors: list[tuple[int,int]] = []
+        for (i, j), pc in env.items():
+            try:
+                if pc.get_type() != piece_type:
+                    continue
+            except Exception:
+                continue
+            if piece_type == "B" and (j == 2 or j == n - 3):
+                anchors.append((i, j))
+            elif piece_type == "R" and (i == 2 or i == n - 3):
+                anchors.append((i, j))
+        print(f"[MyPlayer][zig] anchors_candidates={len(anchors)} list={[self._pos_to_an(a, n) for a in anchors]}")
+
+        for anchor in anchors:
+            anchor_an = self._pos_to_an(anchor, n)
+
+            # Specs brutes (4-3-2) sans vérif bornes pour diagnostiquer précisément
+            raw = self._ziggurat_specs_raw(state, anchor, piece_type)
+            if not raw:
+                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason not_allowed_anchor)")
+                continue
+
+            rows = raw["carrier"]
+            A_raw, B_raw = raw["escapes"]
+
+            # Vérifs structurelles
+            if len(rows) != 9:
+                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason carrier_len={len(rows)})")
+                continue
+            if len(set(rows)) != 9:
+                # extraire les doublons
+                seen = set()
+                dups = []
+                for r in rows:
+                    if r in seen and r not in dups:
+                        dups.append(r)
+                    seen.add(r)
+                dups_an = [self._pos_to_an(r, n) for r in dups if 0 <= r[0] < n and 0 <= r[1] < n]
+                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason duplicates={dups_an})")
+                continue
+
+            # Vérif bornes
+            oob = [(ci, cj) for (ci, cj) in rows if not (0 <= ci < n and 0 <= cj < n)]
+            if oob:
+                oob_an = [self._pos_to_an(c, n) if (0 <= c[0] < n and 0 <= c[1] < n) else str(c) for c in oob]
+                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason out_of_bounds={oob_an})")
+                continue
+
+            # Vérif "état avant intrusion": tout vide sauf éventuellement last_pos (adversaire)
+            blockers = []
+            intruder_inside = False
+            for (ci, cj) in rows:
+                # Ignorer l'ancre (elle est à nous et peut être occupée)
+                if (ci, cj) == anchor:
+                    continue
+                occ = env.get((ci, cj))
+                occ_t = None
+                try:
+                    occ_t = occ.get_type() if occ is not None else None
+                except Exception:
+                    occ_t = None
+                if (ci, cj) == last_pos:
+                    intruder_inside = (occ_t == opp_type)
+                elif occ_t is not None:
+                    blockers.append((ci, cj))
+
+            if blockers:
+                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason not_empty={[self._pos_to_an(b, n) for b in blockers]})")
+                continue
+            if not intruder_inside:
+                # soit last_pos n'est pas dedans, soit ce n'est pas une pierre adverse
+                inside = last_pos in rows
+                reason = "last_pos_not_in_carrier" if not inside else "last_pos_not_opp"
+                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason {reason})")
+                continue
+
+            # Ici: ziggurat détecté avec intrusion
+            spec = {"orientation": raw["orientation"], "carrier": rows, "escapes": (A_raw, B_raw)}
+            A, B = spec["escapes"]
+            print(f"[MyPlayer] ziggurat_detect anchor={anchor_an} orient={spec['orientation']} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)})")
+
+            a_free = env.get(A) is None
+            b_free = env.get(B) is None
+            print(f"[MyPlayer][zig] escapes_free A={a_free} B={b_free}")
+
+            choice: Optional[tuple[int,int]] = None
+            orient = spec["orientation"]
+            side = self._classify_zig_with_orient(anchor, last_pos, orient)
+
+            # Règle générale: côté gauche => préférer B, côté droit => préférer A
+            if side == "left":
+                pref = "B"
+            elif side == "right":
+                pref = "A"
+            else:
+                pref = None
+
+            print(f"[MyPlayer][zig] orient={orient} side={side} prefer={pref if pref else 'none'}")
+
+            if pref == "A":
+                choice = A if a_free else (B if b_free else None)
+            elif pref == "B":
+                choice = B if b_free else (A if a_free else None)
+            else:
+                # Fallback: choisir l'escape la plus éloignée de l'intrus si les deux sont libres
+                if a_free and b_free:
+                    li, lj = last_pos
+                    dA = abs(li - A[0]) + abs(lj - A[1])
+                    dB = abs(li - B[0]) + abs(lj - B[1])
+                    choice = A if dA > dB else B
+                elif a_free:
+                    choice = A
+                elif b_free:
+                    choice = B
+
+            if choice:
+                print(f"[MyPlayer] ziggurat_intrusion anchor={anchor_an} orient={spec['orientation']} intruder={self._pos_to_an(last_pos, n)} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)}) choose={self._pos_to_an(choice, n)}")
+                return choice
+
+        print("[MyPlayer][zig] no ziggurat response found")
+        return None
+ 
+    def _ziggurat_formation_bonus(self, state: GameStateHex, pos: tuple[int,int]) -> float:
+        """
+        Bonus si jouer pos crée une ancre de ziggurat valide (4 variantes).
+        """
+        i, j = pos
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+ 
+        # Pos doit être sur un rang d'ancre autorisé
+        if self.piece_type == "B" and not (j == 2 or j == n - 3):
+            return 0.0
+        if self.piece_type == "R" and not (i == 2 or i == n - 3):
+            return 0.0
+ 
+        # Simuler le coup et valider via specs
+        child = cast(GameStateHex, state.apply_action(LightAction({"piece": self.piece_type, "position": pos})))
+        if not self._detect_ziggurat(child, pos, self.piece_type):
+            return 0.0
+ 
+        spec = self._ziggurat_specs(child, pos, self.piece_type)
+        if not spec:
+            return 0.0
+ 
+        n_child = cast(BoardHex, child.get_rep()).get_dimensions()[0]
+        A, B = spec["escapes"]
+        return 0.20
+ 
+    # ========== FIN ZIGGURAT ==========
+ 
+    def _bridge_intrusion_replies(self, state: GameStateHex, piece_type: str, last_pos: Optional[tuple[int,int]]) -> list[tuple[tuple[int,int], tuple[int,int], tuple[int,int], tuple[int,int]]]:
+        """P4: Détection réactive d'intrusion dans un bridge"""
+        if not last_pos:
+            return []
+        
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        opp_type = "B" if piece_type == "R" else "R"
+        
+        intr = env.get(last_pos)
+        if not intr or intr.get_type() != opp_type:
+            return []
+        
+        li, lj = last_pos
+        
+        def neigh_coords(i, j):
+            s = set()
+            for n_type, (ni, nj) in state.get_neighbours(i, j).values():
+                if n_type != "OUTSIDE":
+                    s.add((ni, nj))
+            return s
+        
+        def are_neighbors(a, b):
+            for _, (ni, nj) in state.get_neighbours(a[0], a[1]).values():
+                if (ni, nj) == b:
+                    return True
+            return False
+        
+        last_neigh = []
+        for n_type, (ni, nj) in state.get_neighbours(li, lj).values():
+            if n_type == "EMPTY":
+                last_neigh.append((ni, nj))
+        
+        replies = []
+        N_last = neigh_coords(li, lj)
+        
+        for ei, ej in last_neigh:
+            N_e = neigh_coords(ei, ej)
+            commons = N_last & N_e
+            allies = []
+            for ci, cj in commons:
+                p = env.get((ci, cj))
+                if p and p.get_type() == piece_type:
+                    allies.append((ci, cj))
+            if len(allies) != 2:
+                continue
+            a1, a2 = allies
+            if are_neighbors(a1, a2):
+                continue
+            replies.append(((ei, ej), a1, a2, last_pos))
+        
+        return replies
+
+    def _handle_bridge_replies(self, state: GameStateHex, replies: list, actions: list[LightAction]) -> Optional[LightAction]:
+        """Gère les réponses aux intrusions de bridge"""
+        d_now = self._connection_distance(state, self.piece_type)
+        reply_positions = {rp for (rp, _, _, _) in replies}
+        candidates = [a for a in actions if a.data.get("position") in reply_positions]
+        
+        best_bridge = None
+        best_val = float("-inf")
+        
+        for a in candidates:
+            child = cast(GameStateHex, state.apply_action(a))
+            if self._connection_distance(child, self.piece_type) <= d_now:
+                v = self._fast_static_eval(child)
+                if v > best_val:
+                    best_val = v
+                    best_bridge = a
+        
+        if best_bridge:
+            rep = cast(BoardHex, state.get_rep())
+            n = rep.get_dimensions()[0]
+            pos = best_bridge.data.get("position")
+            if isinstance(pos, tuple):
+                print(f"[MyPlayer] bridge_intrusion reply={self._pos_to_an(pos, n)}")
+        
+        return best_bridge
+
+    def _choose_best_from_candidates(self, state: GameStateHex, candidates: list[LightAction]) -> Optional[LightAction]:
+        """Choisit le meilleur coup parmi une liste de candidats"""
+        best = None
+        best_val = float("-inf")
+        for a in candidates:
+            child = cast(GameStateHex, state.apply_action(a))
+            v = self._fast_static_eval(child)
+            if v > best_val:
+                best_val = v
+                best = a
+        return best
+
+    # ========== ÉPINE DORSALE & BRIDGES (P3.2) ==========
+
+    def _guiding_spine(self, state: GameStateHex, piece_type: str) -> list[tuple[int,int]]:
+        """Calcule l'épine dorsale (plus court chemin bord→bord)"""
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+        
+        def cell_type(i, j):
+            p = env.get((i, j))
+            if p is None:
+                return "EMPTY"
+            try:
+                return p.get_type()
+            except:
+                return "EMPTY"
+        
+        sources, goals = [], set()
+        if piece_type == "R":
+            for j in range(n):
+                t = cell_type(0, j)
+                if t != "B":
+                    sources.append((0, j))
+            for j in range(n):
+                goals.add((n-1, j))
+        else:
+            for i in range(n):
+                t = cell_type(i, 0)
+                if t != "R":
+                    sources.append((i, 0))
+            for i in range(n):
+                goals.add((i, n-1))
+        
+        INF = 10**9
+        dist = [[INF]*n for _ in range(n)]
+        par: list[list[Optional[tuple[int, int]]]] = [[None for _ in range(n)] for _ in range(n)]
+        pq = []
+        
+        for i, j in sources:
+            t = cell_type(i, j)
+            if t == piece_type:
+                d = 0
+            elif t == "EMPTY":
+                d = 1
+            else:
+                continue
+            dist[i][j] = d
+            heapq.heappush(pq, (d, (i, j)))
+        
+        while pq:
+            d, (i, j) = heapq.heappop(pq)
+            if d > dist[i][j]:
+                continue
+            if (i, j) in goals:
+                path = []
+                cur = (i, j)
+                while cur is not None:
+                    path.append(cur)
+                    pi, pj = cur
+                    cur = par[pi][pj]
+                path.reverse()
+                return path
+            
+            for n_type, (ni, nj) in state.get_neighbours(i, j).values():
+                if n_type == "OUTSIDE":
+                    continue
+                if n_type == piece_type:
+                    nd = d
+                elif n_type == "EMPTY":
+                    nd = d + 1
+                else:
+                    nd = INF
+                
+                if nd < dist[ni][nj]:
+                    dist[ni][nj] = nd
+                    par[ni][nj] = cast(tuple[int, int], (i, j))
+                    heapq.heappush(pq, (nd, (ni, nj)))
+        
+        return []
+
+    def _dist_to_spine(self, pos: tuple[int,int], spine: list[tuple[int,int]]) -> int:
+        """Distance Manhattan approximative à l'épine"""
+        if not spine:
+            return 3
+        pi, pj = pos
+        best = 10**9
+        for si, sj in spine:
+            d = abs(pi - si) + abs(pj - sj)
+            if d < best:
+                best = d
+            if best == 0:
+                break
+        return best
+
+    def _bridge_creation_info(self, state: GameStateHex, piece_type: str, pos: tuple[int,int]) -> list[tuple[set, tuple[int,int], bool]]:
+        """Détecte si jouer pos crée/complète un bridge"""
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+        
+        if env.get(pos) is not None:
+            return []
+        
+        i, j = pos
+        patterns = [
+            ((+1,+1), [(0,+1),(+1,0)]),
+            ((-1,-1), [(-1,0),(0,-1)]),
+            ((+1,-1), [(0,-1),(+1,0)]),
+            ((-1,+1), [(-1,0),(0,+1)]),
+            ((+2,-1), [(+1,0),(+1,-1)]),
+            ((-2,+1), [(-1,0),(-1,+1)]),
+        ]
+        
+        def inb(x, y):
+            return 0 <= x < n and 0 <= y < n
+        
+        out = []
+        for dx, dy in [p[0] for p in patterns]:
+            bi, bj = i + dx, j + dy
+            if not inb(bi, bj):
+                continue
+            pB = env.get((bi, bj))
+            if not pB or pB.get_type() != piece_type:
+                continue
+            
+            hrels = None
+            for p, hr in patterns:
+                if p == (dx, dy):
+                    hrels = hr
                     break
-            return value
+            if not hrels:
+                continue
+            
+            holes = []
+            for hr in hrels:
+                hi, hj = i + hr[0], j + hr[1]
+                if inb(hi, hj):
+                    holes.append((hi, hj))
+            
+            if len(holes) == 2:
+                is_comp = False
+                for h in holes:
+                    q = env.get(h)
+                    if q and q.get_type() == piece_type:
+                        is_comp = True
+                        break
+                out.append((set(holes), (bi, bj), is_comp))
+        
+        return out
+
+    def _bridge_guided_bonus(self, state: GameStateHex, pos: tuple[int,int], spine: list[tuple[int,int]]) -> float:
+        """P3.2: Bonus épine + bridges + gradient"""
+        if not (isinstance(pos, tuple) and len(pos) == 2):
+            return 0.0
+        
+        # Proximité épine
+        dsp = self._dist_to_spine(pos, spine)
+        proximity = 0.12 * (1.0 / (1 + dsp))
+        
+        # Gradient distance
+        d0 = self._connection_distance(state, self.piece_type)
+        child = cast(GameStateHex, state.apply_action(LightAction({"piece": self.piece_type, "position": pos})))
+        d1 = self._connection_distance(child, self.piece_type)
+        gradient = 0.0
+        if d1 < d0:
+            gradient += 0.12
+        elif dsp >= 2:
+            gradient -= 0.06
+        
+        # Bridges
+        info = self._bridge_creation_info(state, self.piece_type, pos)
+        if info:
+            BRIDGE_COMPLETE = 0.40
+            BRIDGE_CREATE = 0.25
+            best = 0.0
+            for holes, ally, is_comp in info:
+                near = min(self._dist_to_spine(h, spine) for h in holes) <= 1
+                if near:
+                    cand = BRIDGE_COMPLETE if is_comp else BRIDGE_CREATE
+                    if cand > best:
+                        best = cand
+            return best + proximity + gradient
+        
+        return proximity + gradient
+
+    # ========== ÉVALUATION & HEURISTIQUES ==========
 
     def _utility(self, state: GameState) -> int:
-        """
-        +1 si je gagne, -1 si l'adversaire gagne, 0 sinon (sécurité).
-        """
+        """Utilité terminale: +1 si je gagne, -1 sinon"""
         scores = state.get_scores()
         my_id = self.get_id()
         if scores.get(my_id, 0) == 1:
@@ -401,117 +1398,85 @@ class MyPlayer(PlayerHex):
         return 0
 
     def _evaluate(self, state: GameStateHex) -> float:
-        """
-        Phase 2 — Evaluation principale combinant:
-        - base rapide (_fast_static_eval): pions, ancrage, présence, centre, etc.
-        - distance de connexion (opp_dist - my_dist) normalisée par n
-        """
-        # 1) terminal
+        """P2: Évaluation H1 (base + distance)"""
         if state.is_done():
             return float(self._utility(state))
-
-        # 2) mode aléatoire (inchangé)
-        if self._heuristic == "random":
-            return random.uniform(-0.1, 0.1)
-
-        # 3) base actuelle
+        
         base = self._fast_static_eval(state)
-
-        # 4) distances de connexion
+        
         my_type = self.piece_type
         opp_type = "B" if my_type == "R" else "R"
-
+        
         my_dist = self._connection_distance(state, my_type)
         opp_dist = self._connection_distance(state, opp_type)
-
+        
         rep = cast(BoardHex, state.get_rep())
         n = rep.get_dimensions()[0]
-
-        # plus c'est grand, mieux c'est pour nous (ils sont plus loin que nous)
         dist_term = (opp_dist - my_dist) / max(1, n)
-
-        # 5) combinaison avec poids significatif pour la distance
-        return float(0.55 * base + 0.45 * dist_term)
+        
+        return float(0.35 * base + 0.65 * dist_term)
 
     def _fast_static_eval(self, state: GameStateHex) -> float:
-        """
-        Heuristique rapide:
-        val = 0.8 * piece_diff_norm + 0.2 * center_term
-        """
+        """Évaluation rapide: pions, ancrage, présence, centre, cluster"""
         rep = cast(BoardHex, state.get_rep())
         env = rep.get_env()
         n = rep.get_dimensions()[0]
-
+        
         my_type = self.piece_type
         opp_type = "B" if my_type == "R" else "R"
-
-        # Différence de pièces (normalisée)
-        our = 0
-        opp = 0
+        
+        # Pions
+        our, opp = 0, 0
         for p in env.values():
             t = p.get_type()
             if t == my_type:
                 our += 1
             elif t == opp_type:
                 opp += 1
-        denom = max(1, our + opp)
-        piece_diff = (our - opp) / denom
-
-        # Centralité relative
+        piece_diff = (our - opp) / max(1, our + opp)
+        
+        # Centre
         c_my = self._center_score(state, my_type)
         c_opp = self._center_score(state, opp_type)
         center_term = (c_opp - c_my) / max(1, n)
-
-        # Ancrage bords (plus proche des deux bords cibles = meilleur)
+        
+        # Ancrage
         a_my = self._edge_anchor_score(state, my_type)
         a_opp = self._edge_anchor_score(state, opp_type)
         anchor_term = (a_opp - a_my) / max(1, n)
-
-        # Décongestion: préférer être moins aggloméré que l'adversaire
-        cl_my = self._cluster_score(state, my_type)   # [0,6] voisins moyens
+        
+        # Cluster
+        cl_my = self._cluster_score(state, my_type)
         cl_opp = self._cluster_score(state, opp_type)
-        # positif si nous sommes moins agglomérés
         cluster_term = (cl_opp - cl_my) / 6.0
-
-        # Présence sur les deux bords cibles (0, 0.5, 1.0)
+        
+        # Présence bords
         presence_term = self._edge_presence_score(state, my_type) - self._edge_presence_score(state, opp_type)
-
-        # pondérations ajustées: renforcer l'ancrage et l'accès aux bords, atténuer la dispersion
-        val = 0.42 * piece_diff + 0.33 * anchor_term + 0.19 * presence_term + 0.05 * center_term + 0.01 * cluster_term
-        if val > 0.9:
-            val = 0.9
-        if val < -0.9:
-            val = -0.9
-        return float(val)
+        
+        val = 0.25 * piece_diff + 0.35 * anchor_term + 0.20 * presence_term + 0.15 * center_term + 0.05 * cluster_term
+        return max(-0.9, min(0.9, val))
 
     def _root_order_score(self, state: GameStateHex) -> float:
-        """
-        Score plus coûteux pour l'ORDONNANCEMENT AU NIVEAU RACINE UNIQUEMENT:
-        combine l'éval rapide + distance (Dijkstra 0-1) + ancrage bords.
-        """
+        """Score pour ordonnancement racine: base + distance + ancrage"""
         base = self._fast_static_eval(state)
-
+        
         rep = cast(BoardHex, state.get_rep())
         n = rep.get_dimensions()[0]
         my_type = self.piece_type
         opp_type = "B" if my_type == "R" else "R"
-
+        
         d_my = self._connection_distance(state, my_type)
         d_opp = self._connection_distance(state, opp_type)
         dist_term = (d_opp - d_my) / max(1, n)
-
+        
         a_my = self._edge_anchor_score(state, my_type)
         a_opp = self._edge_anchor_score(state, opp_type)
         anchor_term = (a_opp - a_my) / max(1, n)
+        
+        val = 0.35 * base + 0.45 * dist_term + 0.20 * anchor_term
+        return max(-0.9, min(0.9, val))
 
-        val = 0.5 * base + 0.3 * dist_term + 0.2 * anchor_term
-        if val > 0.9:
-            val = 0.9
-        if val < -0.9:
-            val = -0.9
-        return float(val)
-
-    # ---------- Helpers défensifs / ancrage / dispersion ----------
+    # ========== HELPERS MÉTRIQUES ==========
 
     def _find_opponent(self, state: GameStateHex):
         for p in state.players:
@@ -519,32 +1484,14 @@ class MyPlayer(PlayerHex):
                 return p
         return state.players[0]
 
-    def _must_block_cells(self, state: GameStateHex) -> set[tuple[int, int]]:
-        """
-        Retourne les cases où, si l'adversaire joue, il gagne immédiatement.
-        """
-        rep = cast(BoardHex, state.get_rep())
-        opp = self._find_opponent(state)
-        opp_type = "B" if self.piece_type == "R" else "R"
-        threats: set[tuple[int, int]] = set()
-        for pos in rep.get_empty():
-            scores = state.compute_scores((pos, opp_type, opp.get_id()))
-            if scores.get(opp.get_id(), 0) == 1:
-                threats.add(pos)
-        return threats
-
     def _edge_anchor_score(self, state: GameStateHex, piece_type: str) -> int:
-        """
-        Mesure d'ancrage aux bords cibles: somme des distances min aux deux bords.
-        Plus petit = meilleur.
-        """
+        """Distance min aux deux bords cibles"""
         rep = cast(BoardHex, state.get_rep())
         env = rep.get_env()
         n = rep.get_dimensions()[0]
+        
         if piece_type == "R":
-            # Bords haut (i=0) et bas (i=n-1)
-            top = n
-            bot = n
+            top, bot = n, n
             for (i, j), p in env.items():
                 if p.get_type() == piece_type:
                     if i < top:
@@ -554,9 +1501,7 @@ class MyPlayer(PlayerHex):
                         bot = d_bot
             return top + bot if (top != n or bot != n) else n
         else:
-            # Bords gauche (j=0) et droit (j=n-1)
-            left = n
-            right = n
+            left, right = n, n
             for (i, j), p in env.items():
                 if p.get_type() == piece_type:
                     if j < left:
@@ -567,13 +1512,10 @@ class MyPlayer(PlayerHex):
             return left + right if (left != n or right != n) else n
 
     def _cluster_score(self, state: GameStateHex, piece_type: str) -> float:
-        """
-        Nombre moyen de voisins de même couleur par pièce (6 max). Plus petit = plus dispersé.
-        """
+        """Nombre moyen de voisins alliés par pièce"""
         rep = cast(BoardHex, state.get_rep())
         env = rep.get_env()
-        tot_neighbors = 0
-        count = 0
+        tot, count = 0, 0
         for (i, j), p in env.items():
             if p.get_type() != piece_type:
                 continue
@@ -581,23 +1523,16 @@ class MyPlayer(PlayerHex):
             for n_type, _ in state.get_neighbours(i, j).values():
                 if n_type == piece_type:
                     same += 1
-            tot_neighbors += same
+            tot += same
             count += 1
-        if count == 0:
-            return 0.0
-        return tot_neighbors / float(count)
+        return tot / float(count) if count else 0.0
 
     def _edge_presence_score(self, state: GameStateHex, piece_type: str) -> float:
-        """
-        Retourne 1.0 si au moins une pierre touche chacun des deux bords cibles,
-        0.5 si un seul bord est touché, 0.0 sinon.
-        - Rouge: bords haut (i=0) et bas (i=n-1)
-        - Bleu:  bords gauche (j=0) et droit (j=n-1)
-        """
+        """1.0 si présent sur les 2 bords, 0.5 si 1 seul, 0.0 sinon"""
         rep = cast(BoardHex, state.get_rep())
         env = rep.get_env()
         n = rep.get_dimensions()[0]
-
+        
         has_top = has_bottom = has_left = has_right = False
         for (i, j), p in env.items():
             if p.get_type() != piece_type:
@@ -612,198 +1547,90 @@ class MyPlayer(PlayerHex):
                     has_left = True
                 if j == n - 1:
                     has_right = True
-
+        
         if piece_type == "R":
             return 1.0 if (has_top and has_bottom) else (0.5 if (has_top or has_bottom) else 0.0)
         else:
             return 1.0 if (has_left and has_right) else (0.5 if (has_left or has_right) else 0.0)
 
-    def _bridge_holes(self, state: GameStateHex, piece_type: str) -> set[tuple[int, int]]:
-        """
-        Détecte les trous (cases vides) de bridges (ponts) entre deux pierres alliées.
-        Motifs couverts:
-          - 4 diagonales: (+1,+1), (-1,-1), (-1,+1), (+1,-1)
-          - 2 « verticaux » (sens axial): (+2,-1) et (-2,+1)
-        Cas gérés:
-          - les deux trous vides  -> renvoie les deux cases
-          - un trou occupé par l'adversaire et l'autre vide -> renvoie la case vide (complétion urgente)
-        """
+    def _bridge_holes(self, state: GameStateHex, piece_type: str) -> set[tuple[int,int]]:
+        """Détecte tous les trous de bridges"""
         rep = cast(BoardHex, state.get_rep())
         env = rep.get_env()
-        holes: set[tuple[int, int]] = set()
+        holes = set()
         opp_type = "B" if piece_type == "R" else "R"
-
-        # Accès rapide au type d'une case
-        def t(i: int, j: int):
-            p = env.get((i, j))
-            return None if p is None else p.get_type()
-
         n = rep.get_dimensions()[0]
-        def inb(i: int, j: int) -> bool:
+        
+        def inb(i, j):
             return 0 <= i < n and 0 <= j < n
-
-        def consider_pair(h1: tuple[int, int], h2: tuple[int, int]) -> None:
+        
+        def consider_pair(h1, h2):
             if not (inb(*h1) and inb(*h2)):
                 return
             s1 = env.get(h1)
             s2 = env.get(h2)
             if s1 is None and s2 is None:
-                holes.add(h1); holes.add(h2)
+                holes.add(h1)
+                holes.add(h2)
                 return
-            # si un seul est vide et l'autre occupé par l'adversaire -> compléter le pont
             if s1 is None and s2 is not None:
                 try:
                     if s2.get_type() == opp_type:
                         holes.add(h1)
-                except Exception:
+                except:
                     pass
             elif s2 is None and s1 is not None:
                 try:
                     if s1.get_type() == opp_type:
                         holes.add(h2)
-                except Exception:
+                except:
                     pass
-
+        
         for (i, j), p in env.items():
             if p.get_type() != piece_type:
                 continue
-            # diagonale (i+1, j+1): trous (i, j+1) et (i+1, j)
-            pi, pj = i + 1, j + 1
-            if inb(pi, pj) and t(pi, pj) == piece_type:
-                consider_pair((i, j + 1), (i + 1, j))
-            # diagonale (i-1, j-1): trous (i-1, j) et (i, j-1)
-            pi, pj = i - 1, j - 1
-            if inb(pi, pj) and t(pi, pj) == piece_type:
-                consider_pair((i - 1, j), (i, j - 1))
-            # diagonale (i-1, j+1): trous (i-1, j) et (i, j+1)
-            pi, pj = i - 1, j + 1
-            if inb(pi, pj) and t(pi, pj) == piece_type:
-                consider_pair((i - 1, j), (i, j + 1))
-            # diagonale (i+1, j-1): trous (i, j-1) et (i+1, j)
-            pi, pj = i + 1, j - 1
-            if inb(pi, pj) and t(pi, pj) == piece_type:
-                consider_pair((i, j - 1), (i + 1, j))
-            # « vertical » (i+2, j-1): trous (i+1, j) et (i+1, j-1)
-            pi, pj = i + 2, j - 1
-            if inb(pi, pj) and t(pi, pj) == piece_type:
-                consider_pair((i + 1, j), (i + 1, j - 1))
-            # « vertical » (i-2, j+1): trous (i-1, j) et (i-1, j+1)
-            pi, pj = i - 2, j + 1
-            if inb(pi, pj) and t(pi, pj) == piece_type:
-                consider_pair((i - 1, j), (i - 1, j + 1))
+            
+            # 4 diagonales + 2 verticaux
+            pairs = [
+                ((i+1, j+1), [(i, j+1), (i+1, j)]),
+                ((i-1, j-1), [(i-1, j), (i, j-1)]),
+                ((i-1, j+1), [(i-1, j), (i, j+1)]),
+                ((i+1, j-1), [(i, j-1), (i+1, j)]),
+                ((i+2, j-1), [(i+1, j), (i+1, j-1)]),
+                ((i-2, j+1), [(i-1, j), (i-1, j+1)]),
+            ]
+            
+            for (pi, pj), hole_pair in pairs:
+                if inb(pi, pj):
+                    pp = env.get((pi, pj))
+                    if pp and pp.get_type() == piece_type:
+                        consider_pair(hole_pair[0], hole_pair[1])
+        
         return holes
 
-    def _bridge_intrusion_replies(
-        self,
-        state: GameStateHex,
-        piece_type: str,
-        last_pos: Optional[tuple[int, int]] = None
-    ) -> list[tuple[tuple[int,int], tuple[int,int], tuple[int,int], tuple[int,int]]]:
-        """
-        Détecte de manière STRICTEMENT réactive une intrusion adverse dans un trou de pont:
-        - On exige que last_pos soit connu ET soit effectivement une pierre adverse.
-        - On considère chaque voisin vide E de last_pos. Si les deux voisins COMMUNS de (last_pos, E)
-          sont occupés par deux alliés NON-VOISINS entre eux, alors (last_pos, E) sont les deux trous d’un pont.
-          La réponse est de jouer E.
-        - Renvoie une liste [(reply_pos, ally1, ally2, intruder_pos)].
-        Cette méthode couvre automatiquement les 6 orientations (4 diagonales + 2 « verticales »).
-        """
-        if last_pos is None:
-            return []
-        rep = cast(BoardHex, state.get_rep())
-        env = rep.get_env()
-        opp_type = "B" if piece_type == "R" else "R"
-        li, lj = last_pos
-
-        # Vérifier que last_pos contient bien une pierre adverse
-        intr = env.get((li, lj))
-        if intr is None or intr.get_type() != opp_type:
-            return []
-
-        def neigh_coords(i: int, j: int) -> set[tuple[int,int]]:
-            s: set[tuple[int,int]] = set()
-            for n_type, (ni, nj) in state.get_neighbours(i, j).values():
-                if n_type != "OUTSIDE":
-                    s.add((ni, nj))
-            return s
-
-        def are_neighbors(a: tuple[int,int], b: tuple[int,int]) -> bool:
-            ai, aj = a
-            for _, (ni, nj) in state.get_neighbours(ai, aj).values():
-                if (ni, nj) == b:
-                    return True
-            return False
-
-        last_neigh = []
-        for n_type, (ni, nj) in state.get_neighbours(li, lj).values():
-            if n_type == "EMPTY":
-                last_neigh.append((ni, nj))
-
-        replies: list[tuple[tuple[int,int], tuple[int,int], tuple[int,int], tuple[int,int]]] = []
-        N_last = neigh_coords(li, lj)
-
-        for ei, ej in last_neigh:
-            N_e = neigh_coords(ei, ej)
-            commons = N_last & N_e
-            # Sélectionner exactement deux voisins communs alliés
-            allies = []
-            for ci, cj in commons:
-                p = env.get((ci, cj))
-                if p is not None and p.get_type() == piece_type:
-                    allies.append((ci, cj))
-            if len(allies) != 2:
-                continue
-            a1, a2 = allies[0], allies[1]
-            # Écarter les faux positifs (les deux alliés collés l’un à l’autre)
-            if are_neighbors(a1, a2):
-                continue
-            replies.append(((ei, ej), a1, a2, (li, lj)))
-
-        return replies
-
-    def _friendly_neighbors_count(self, state: GameStateHex, pos: tuple[int, int], piece_type: str) -> int:
-        """
-        Nombre de voisins alliés autour d'une position donnée (0..6) dans l'état fourni.
-        """
-        i, j = pos
+    def _friendly_neighbors_count(self, state: GameStateHex, pos: tuple[int,int], piece_type: str) -> int:
+        """Nombre de voisins alliés"""
         count = 0
-        for n_type, _ in state.get_neighbours(i, j).values():
+        for n_type, _ in state.get_neighbours(pos[0], pos[1]).values():
             if n_type == piece_type:
                 count += 1
         return count
 
-    def _pos_to_an(self, pos: tuple[int, int], n: int) -> str:
-        i, j = pos
-        col = chr(ord('A') + j)
-        return f"{col}{i + 1}"
-
-    def _border_reduce_candidates_from_actions(
-        self,
-        state: GameStateHex,
-        piece_type: str,
-        d0: Optional[int],
-        actions: list[LightAction]
-    ) -> set[tuple[int, int]]:
-        """
-        Détection simple des coups "réduction de bord" (3→2):
-        - On ne considère que l'anneau 2 par rapport aux bords cibles:
-          * Rouge (vertical): i == 1 ou i == n-2
-          * Bleu  (horizontal): j == 1 ou j == n-2
-        - Un coup est retenu s'il réduit la distance de connexion d'au moins 1.
-        """
+    def _border_reduce_candidates_from_actions(self, state: GameStateHex, piece_type: str, d0: Optional[int], actions: list[LightAction]) -> set[tuple[int,int]]:
+        """Candidats de réduction bord (anneau 2)"""
         rep = cast(BoardHex, state.get_rep())
         n = rep.get_dimensions()[0]
         if d0 is None:
             d0 = self._connection_distance(state, piece_type)
-
-        def in_ring2(pos: tuple[int, int]) -> bool:
+        
+        def in_ring2(pos):
             i, j = pos
             if piece_type == "R":
                 return i == 1 or i == n - 2
             else:
                 return j == 1 or j == n - 2
-
-        cands: set[tuple[int, int]] = set()
+        
+        cands = set()
         for a in actions:
             pos = a.data.get("position")
             if not (isinstance(pos, tuple) and len(pos) == 2 and in_ring2(pos)):
@@ -814,39 +1641,25 @@ class MyPlayer(PlayerHex):
                 cands.add(pos)
         return cands
 
- 
-    # ---------- Helpers H1 (distance/centre) ----------
-
     def _connection_distance(self, state: GameStateHex, piece_type: str) -> int:
-        """
-        Distance de connexion bord-à-bord par Dijkstra:
-        - on traverse nos pierres à coût 0
-        - les vides coûtent 1
-        - les pierres adverses sont impassables
-        Retourne une approximation de la longueur minimale.
-        """
-        import heapq
-
+        """Distance de connexion bord-à-bord par Dijkstra 0-1"""
         rep = cast(BoardHex, state.get_rep())
         env = rep.get_env()
         n = rep.get_dimensions()[0]
-
-        def cell_type(i: int, j: int) -> str:
+        
+        def cell_type(i, j):
             p = env.get((i, j))
             if p is None:
                 return "EMPTY"
             try:
-                t = p.get_type()
-            except Exception:
-                t = getattr(p, "piece_type", None)
-            return t if t is not None else "EMPTY"
-
-        # Initialisation selon l’axe de connexion
+                return p.get_type()
+            except:
+                return "EMPTY"
+        
         dist = [[float("inf")] * n for _ in range(n)]
-        pq = []  # (d, (i,j))
-
+        pq = []
+        
         if piece_type == "R":
-            # de la rangée 0 vers rangée n-1
             goals = {(n - 1, j) for j in range(n)}
             for j in range(n):
                 t = cell_type(0, j)
@@ -858,7 +1671,6 @@ class MyPlayer(PlayerHex):
                     continue
                 heapq.heappush(pq, (dist[0][j], (0, j)))
         else:
-            # de la colonne 0 vers colonne n-1
             goals = {(i, n - 1) for i in range(n)}
             for i in range(n):
                 t = cell_type(i, 0)
@@ -869,14 +1681,14 @@ class MyPlayer(PlayerHex):
                 else:
                     continue
                 heapq.heappush(pq, (dist[i][0], (i, 0)))
-
-        # Dijkstra sur le graphe hex
+        
         while pq:
             d, (i, j) = heapq.heappop(pq)
             if d > dist[i][j]:
                 continue
             if (i, j) in goals:
                 return int(d)
+            
             for n_type, (ni, nj) in state.get_neighbours(i, j).values():
                 if n_type == "OUTSIDE":
                     continue
@@ -885,36 +1697,35 @@ class MyPlayer(PlayerHex):
                 elif n_type == piece_type:
                     nd = d
                 else:
-                    # pièce adverse, impassable
                     continue
+                
                 if nd < dist[ni][nj]:
                     dist[ni][nj] = nd
                     heapq.heappush(pq, (nd, (ni, nj)))
-
-        # Non atteignable: renvoyer une valeur élevée mais bornée
+        
         return n * 2
 
     def _center_score(self, state: GameStateHex, piece_type: str) -> float:
-        """
-        Score moyen de distance au centre pour les pierres d'un type (plus petit = mieux).
-        Si aucune pierre, retourne n (pénalité neutre).
-        """
+        """Score moyen de distance au centre (plus petit = mieux)"""
         rep = cast(BoardHex, state.get_rep())
         env = rep.get_env()
         n = rep.get_dimensions()[0]
         mid = (n - 1) / 2.0
-
-        s = 0.0
-        c = 0
+        
+        s, c = 0.0, 0
         for (i, j), p in env.items():
             try:
                 t = p.get_type()
-            except Exception:
-                t = getattr(p, "piece_type", None)
+            except:
+                t = None
             if t == piece_type:
-                # distance "Manhattan" sur grille approximative
                 s += abs(i - mid) + abs(j - mid)
                 c += 1
-        if c == 0:
-            return float(n)
-        return s / c
+        
+        return s / c if c else float(n)
+
+    def _pos_to_an(self, pos: tuple[int, int], n: int) -> str:
+        """Convertit une position (i,j) en notation algébrique (ex: A1)"""
+        i, j = pos
+        col = chr(ord('A') + j)
+        return f"{col}{i + 1}"
