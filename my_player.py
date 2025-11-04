@@ -134,56 +134,44 @@ class MyPlayer(PlayerHex):
                 self._update_prev_positions(curr_pos_set, best_zig)
                 return best_zig
 
-        # PHASE 4: Edge reduce (réduction 2→1 vers bord)
-        edge21_moves = self._edge_reduce_rank2_to_rank1_for_player(st_hex, self.piece_type)
-        if edge21_moves:
-            actions = list(state.get_possible_light_actions())
-            candidates = [a for a in actions if a.data.get("position") in edge21_moves]
-            if candidates:
-                best_edge21 = self._choose_best_from_candidates(st_hex, candidates)
-                if best_edge21:
-                    pos = best_edge21.data.get("position")
-                    if isinstance(pos, tuple):
-                        print(f"[MyPlayer] edge_reduce_2to1={self._pos_to_an(pos, n)}")
-                        # Log si le coup posé forme un bridge (informationnelle)
+        # PHASE 4-5: Edge reduce (différés jusqu'à la fin d'ouverture)
+        total_stones = len(env)
+        if total_stones >= 10:
+            # PHASE 4: Edge reduce (réduction 2→1 vers bord)
+            edge21_moves = self._edge_reduce_rank2_to_rank1_for_player(st_hex, self.piece_type)
+            if edge21_moves:
+                actions = list(state.get_possible_light_actions())
+                candidates = [a for a in actions if a.data.get("position") in edge21_moves]
+                if candidates:
+                    best_edge21 = self._choose_best_from_candidates(st_hex, candidates)
+                    if best_edge21:
+                        pos = best_edge21.data.get("position")
                         if isinstance(pos, tuple):
-                            self._log_bridge_decision(st_hex, pos, source="edge_2to1")
-                        self._update_prev_positions(curr_pos_set, best_edge21)
-                        return best_edge21
+                            print(f"[MyPlayer] edge_reduce_2to1={self._pos_to_an(pos, n)}")
+                            # Log si le coup posé forme un bridge (informationnelle)
+                            if isinstance(pos, tuple):
+                                self._log_bridge_decision(st_hex, pos, source="edge_2to1")
+                            self._update_prev_positions(curr_pos_set, best_edge21)
+                            return best_edge21
 
-        # PHASE 5: Edge reduce (réduction 3→2)
-        edge_moves = self._edge_reduce_for_player(st_hex, self.piece_type)
-        if edge_moves:
-            actions = list(state.get_possible_light_actions())
-            candidates = [a for a in actions if a.data.get("position") in edge_moves]
-            if candidates:
-                best_edge = self._choose_best_from_candidates(st_hex, candidates)
-                if best_edge:
-                    pos = best_edge.data.get("position")
-                    if isinstance(pos, tuple):
-                        print(f"[MyPlayer] edge_reduce_3to2={self._pos_to_an(pos, n)}")
-                        # Log si le coup posé forme un bridge (informationnelle)
+            # PHASE 5: Edge reduce (réduction 3→2)
+            edge_moves = self._edge_reduce_for_player(st_hex, self.piece_type)
+            if edge_moves:
+                actions = list(state.get_possible_light_actions())
+                candidates = [a for a in actions if a.data.get("position") in edge_moves]
+                if candidates:
+                    best_edge = self._choose_best_from_candidates(st_hex, candidates)
+                    if best_edge:
+                        pos = best_edge.data.get("position")
                         if isinstance(pos, tuple):
-                            self._log_bridge_decision(st_hex, pos, source="edge_3to2")
-                        self._update_prev_positions(curr_pos_set, best_edge)
-                        return best_edge
+                            print(f"[MyPlayer] edge_reduce_3to2={self._pos_to_an(pos, n)}")
+                            # Log si le coup posé forme un bridge (informationnelle)
+                            if isinstance(pos, tuple):
+                                self._log_bridge_decision(st_hex, pos, source="edge_3to2")
+                            self._update_prev_positions(curr_pos_set, best_edge)
+                            return best_edge
 
-        # PHASE 6: Edge double-threat (rang 2 → 2 gagnants en rang 1)
-        edge_threats = self._edge_double_threat_from_last_move(st_hex, last_pos)
-        if edge_threats:
-            actions = list(state.get_possible_light_actions())
-            candidates = [a for a in actions if a.data.get("position") in edge_threats]
-            if candidates:
-                best_et = self._choose_best_from_candidates(st_hex, candidates)
-                if best_et:
-                    print(f"[MyPlayer] edge_double_threat size={len(candidates)}")
-                    # Log si le coup posé forme un bridge (informationnelle)
-                    pos = best_et.data.get("position")
-                    if isinstance(pos, tuple):
-                        self._log_bridge_decision(st_hex, pos, source="edge_double_threat")
-                    self._update_prev_positions(curr_pos_set, best_et)
-                    return best_et
-
+        # PHASE 6: (supprimé) ancien edge double-threat; remplacé prochainement par le module Blocking
         # PHASE 6: IDS + Alpha-bêta avec toutes les optimisations
         best_action = self._iterative_deepening_search(st_hex, last_pos)
         
@@ -723,59 +711,7 @@ class MyPlayer(PlayerHex):
 
         return edge_moves
 
-    def _edge_double_threat_from_last_move(self, state: GameStateHex, last_pos: Optional[tuple[int,int]]) -> set[tuple[int,int]]:
-        """P5.b: Si adversaire en rang 2, bloquer les 2 gagnants en rang 1"""
-        if not last_pos:
-            return set()
-        
-        rep = cast(BoardHex, state.get_rep())
-        env = rep.get_env()
-        n = rep.get_dimensions()[0]
-        
-        opp_type = "B" if self.piece_type == "R" else "R"
-        li, lj = last_pos
-        
-        # Vérifier que c'est bien une pierre adverse
-        p = env.get(last_pos)
-        if not p or p.get_type() != opp_type:
-            return set()
-        
-        # Vérifier si en rang 2
-        in_rank_2 = False
-        if opp_type == "R" and li == 1:
-            in_rank_2 = True
-        elif opp_type == "B" and lj == 1:
-            in_rank_2 = True
-        
-        if not in_rank_2:
-            return set()
-        
-        # Chercher les coups en rang 1 qui font gagner l'adversaire
-        opp = self._find_opponent(state)
-        rank_1_wins = set()
-        
-        if opp_type == "R":
-            # Rang 1 = i==0
-            for jj in range(max(0, lj-2), min(n, lj+3)):
-                pos = (0, jj)
-                if env.get(pos) is None:
-                    scores = state.compute_scores((pos, opp_type, opp.get_id()))
-                    if scores.get(opp.get_id(), 0) == 1:
-                        rank_1_wins.add(pos)
-        else:
-            # Rang 1 = j==0
-            for ii in range(max(0, li-2), min(n, li+3)):
-                pos = (ii, 0)
-                if env.get(pos) is None:
-                    scores = state.compute_scores((pos, opp_type, opp.get_id()))
-                    if scores.get(opp.get_id(), 0) == 1:
-                        rank_1_wins.add(pos)
-        
-        # Si 2+ menaces, retourner toutes
-        if len(rank_1_wins) >= 2:
-            return rank_1_wins
-        
-        return set()
+    # (supprimé) _edge_double_threat_from_last_move: remplacé prochainement par le module Blocking
  
     # ========== ZIGGURAT TEMPLATE (P7+) ==========
  
@@ -1568,6 +1504,16 @@ class MyPlayer(PlayerHex):
         c_my = self._center_score(state, my_type)
         c_opp = self._center_score(state, opp_type)
         center_term = (c_opp - c_my) / max(1, n)
+        # Option B: renforcer le centre en ouverture (log debug)
+        total_stones = len(env)
+        if total_stones <= 10:
+            f_open = 3.0
+        elif total_stones >= 20:
+            f_open = 1.0
+        else:
+            f_open = 3.0 - ((total_stones - 10) / 5.0)
+        center_term *= float(f_open)
+
         
         # Ancrage
         a_my = self._edge_anchor_score(state, my_type)
