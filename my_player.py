@@ -94,20 +94,20 @@ class MyPlayer(PlayerHex):
         if last_pos:
             print(f"[MyPlayer] last_opp={self._pos_to_an(last_pos, n)}")
 
-        # Ouverture forcée temporaire: jouer L6 à NOTRE premier coup (même si l'adversaire a déjà joué)
-        # L6 => (i,j) = (5,11) en notation interne (0-index)
+        # Ouverture forcée temporaire: jouer C7 à NOTRE premier coup (même si l'adversaire a déjà joué)
+        # C7 => (i,j) = (6,2) en notation interne (0-index)
         try:
             my_type = self.piece_type
             my_count = sum(1 for p in env.values() if p.get_type() == my_type)
         except Exception:
             my_count = 0
         if my_count == 0:
-            forced = (5, 11)
+            forced = (6, 2)
             if env.get(forced) is None:
                 actions = list(state.get_possible_light_actions())
                 forced_cand = next((a for a in actions if a.data.get("position") == forced), None)
                 if forced_cand:
-                    print("[MyPlayer] forced_open=L6")
+                    print("[MyPlayer] forced_open=C7")
                     self._update_prev_positions(curr_pos_set, forced_cand)
                     return forced_cand
         
@@ -739,11 +739,12 @@ class MyPlayer(PlayerHex):
  
     # ========== ZIGGURAT TEMPLATE (P7+) ==========
  
-    def _ziggurat_specs_raw(self, state: GameStateHex, anchor: tuple[int,int], piece_type: str) -> Optional[dict]:
+    def _ziggurat_specs_raw(self, state: GameStateHex, anchor: tuple[int,int], piece_type: str, anchor_side: str = "L") -> Optional[dict]:
         """
         Gabarit brut (sans vérif des limites). Renvoie orientation, 9 positions (4-3-2) et escapes (A,B)
         ou None si l'ancre n'est pas sur un rang admissible.
         Règle bord: on décale le triangle pour rester in-bounds (évite j±3/i±3 hors plateau).
+        anchor_side: "L" (ancre à gauche du rang 2) ou "R" (ancre à droite du rang 2).
         """
         rep = cast(BoardHex, state.get_rep())
         n = rep.get_dimensions()[0]
@@ -755,14 +756,23 @@ class MyPlayer(PlayerHex):
 
         if piece_type == "B":
             if j == 2:
-                # C-left: colonnes (j) 2, (j-1) 3, (j-2) 4. Escapes sur (j-1).
+                # C-left (bord gauche)
+                # Ancre à gauche (par défaut): row2 = [(i, j),(i+1, j)] avec ancre = (i, j)
+                # Ancre à droite: décaler i de -1 pour que (i, j) soit la 2e case de row2
+                if anchor_side == "R":
+                    i = i - 1
                 orientation = "B:C-left"
                 row2 = [(i, j), (i+1, j)]
                 row3 = [(i, j-1), (i+1, j-1), (i+2, j-1)]
                 row4 = [(i, j-2), (i+1, j-2), (i+2, j-2), (i+3, j-2)]
+                # Escapes = extrémités du rang 3
                 A, B = (i, j-1), (i+2, j-1)
             elif j == n - 3:
-                # L-right: colonnes (j) 2, (j+1) 3, (j+2) 4. Escapes sur (j+1).
+                # L-right (bord droit)
+                # Ancre à gauche (par défaut): row2 = [(i-1, j),(i, j)] avec ancre = (i, j)
+                # Ancre à droite: décaler i de +1 pour que (i, j) soit la 1ère case de row2
+                if anchor_side == "R":
+                    i = i + 1
                 orientation = "B:L-right"
                 row2 = [(i-1, j), (i, j)]
                 row3 = [(i-2, j+1), (i-1, j+1), (i, j+1)]
@@ -772,14 +782,22 @@ class MyPlayer(PlayerHex):
                 return None
         else:
             if i == 2:
-                # 3-up: lignes (i) 2, (i-1) 3, (i-2) 4. Escapes sur (i-1).
+                # 3-up (bord haut)
+                # Ancre à gauche (par défaut): row2 = [(i, j),(i, j+1)] avec ancre = (i, j)
+                # Ancre à droite: décaler j de -1 pour que (i, j) soit la 2e case de row2
+                if anchor_side == "R":
+                    j = j - 1
                 orientation = "R:3-up"
                 row2 = [(i, j), (i, j+1)]
                 row3 = [(i-1, j), (i-1, j+1), (i-1, j+2)]
                 row4 = [(i-2, j), (i-2, j+1), (i-2, j+2), (i-2, j+3)]
                 A, B = (i-1, j), (i-1, j+2)
             elif i == n - 3:
-                # 12-down: lignes (i) 2, (i+1) 3, (i+2) 4. Escapes sur (i+1).
+                # 12-down (bord bas)
+                # Ancre à gauche (par défaut): row2 = [(i, j-1),(i, j)] avec ancre = (i, j)
+                # Ancre à droite: décaler j de +1 pour que (i, j) soit la 1ère case de row2
+                if anchor_side == "R":
+                    j = j + 1
                 orientation = "R:12-down"
                 row2 = [(i, j-1), (i, j)]
                 row3 = [(i+1, j-2), (i+1, j-1), (i+1, j)]
@@ -789,16 +807,16 @@ class MyPlayer(PlayerHex):
                 return None
 
         rows = row2 + row3 + row4
-        return {"orientation": orientation, "carrier": rows, "escapes": (A, B)}
+        return {"orientation": orientation, "carrier": rows, "escapes": (A, B), "anchor_side": anchor_side}
 
-    def _ziggurat_specs(self, state: GameStateHex, anchor: tuple[int,int], piece_type: str) -> Optional[dict]:
+    def _ziggurat_specs(self, state: GameStateHex, anchor: tuple[int,int], piece_type: str, anchor_side: str = "L") -> Optional[dict]:
         """
         Spécifie un ziggurat valide (triangle 4-3-2 = 9 cases uniques) en vérifiant in-bounds.
         """
         rep = cast(BoardHex, state.get_rep())
         n = rep.get_dimensions()[0]
 
-        raw = self._ziggurat_specs_raw(state, anchor, piece_type)
+        raw = self._ziggurat_specs_raw(state, anchor, piece_type, anchor_side)
         if not raw:
             return None
 
@@ -898,35 +916,64 @@ class MyPlayer(PlayerHex):
             else:
                 return "right"
  
-    def _classify_zig_with_orient(self, anchor: tuple[int,int], intruder: tuple[int,int], orient: str) -> str:
+    def _classify_zig_with_orient(self, anchor: tuple[int,int], intruder: tuple[int,int], orient: str, anchor_side: str) -> str:
         ai, aj = anchor
         ii, ij = intruder
-        # Offsets relatifs (di,dj) depuis l'ancre, dérivés des schémas fournis
+        # Offsets relatifs (di,dj) depuis l'ancre, pour ancre à gauche ("L") et à droite ("R")
         masks = {
             "B:L-right": {
-                "left": [(0, 1), (0, 2), (-1, 2)],
-                "right": [(-1, 0), (-1, 1), (-2, 1), (-2, 2), (-3, 2)],
+                "L": {
+                    "left": [(0, 1), (0, 2), (-1, 2)],
+                    "right": [(-1, 0), (-1, 1), (-2, 1), (-2, 2), (-3, 2)],
+                },
+                "R": {
+                    # ancre à droite (ex L12): gauche = L13,M12,M13,N12,N13; droite = M11,N11,N10
+                    "left": [(+1, 0), (0, +1), (+1, +1), (0, +2), (+1, +2)],
+                    "right": [(-1, +1), (-1, +2), (-2, +2)],
+                },
             },
             "B:C-left": {
-                "left": [(0, -2), (0, -1), (1, -2)],
-                "right": [(1, 0), (1, -1), (2, -2), (2, -1), (3, -2)],
+                "L": {
+                    "left": [(0, -2), (0, -1), (1, -2)],
+                    "right": [(1, 0), (1, -1), (2, -2), (2, -1), (3, -2)],
+                },
+                "R": {
+                    # ancre à droite (ex C9): gauche = A8,B8,C8,A9,B9 ; droite = A11,B11,A12
+                    "left": [(-1, -2), (-1, -1), (-1, 0), (0, -2), (0, -1)],
+                    "right": [(+2, -2), (+2, -1), (+3, -2)],
+                },
             },
             "R:12-down": {
-                "left": [(1, -1), (2, -2), (2, -1)],
-                "right": [(0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+                "L": {
+                    "left": [(1, -1), (2, -2), (2, -1)],
+                    "right": [(0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+                },
+                "R": {
+                    # ancre à droite (ex G12): gauche = F12,E13,F13,D14,E14 ; droite = G13,F14,G14
+                    "left": [(0, -1), (+1, -2), (+1, -1), (+2, -3), (+2, -2)],
+                    "right": [(+1, 0), (+2, -1), (+2, 0)],
+                },
             },
             "R:3-up": {
-                "left": [(-2, 1), (-2, 2), (-1, 1)],
-                "right": [(-2, -1), (-2, 0), (-1, -1), (-1, 0), (0, -1)],
+                "L": {
+                    "left": [(-2, 1), (-2, 2), (-1, 1)],
+                    "right": [(-2, -1), (-2, 0), (-1, -1), (-1, 0), (0, -1)],
+                },
+                "R": {
+                    # ancre à droite (ex G3): gauche = H3,H2,I2,I1,J1 ; droite = G1,H1,G2
+                    "left": [(0, +1), (-1, +1), (-1, +2), (-2, +2), (-2, +3)],
+                    "right": [(-2, 0), (-2, +1), (-1, 0)],
+                },
             },
         }
-        m = masks.get(orient)
-        if not m:
+        mo = masks.get(orient)
+        if not mo:
             return "unknown"
+        m = mo.get(anchor_side, {})
         di, dj = ii - ai, ij - aj
-        if (di, dj) in m["left"]:
+        if (di, dj) in m.get("left", []):
             return "left"
-        if (di, dj) in m["right"]:
+        if (di, dj) in m.get("right", []):
             return "right"
         return "unknown"
 
@@ -973,108 +1020,116 @@ class MyPlayer(PlayerHex):
         for anchor in anchors:
             anchor_an = self._pos_to_an(anchor, n)
 
-            # Specs brutes (4-3-2) sans vérif bornes pour diagnostiquer précisément
-            raw = self._ziggurat_specs_raw(state, anchor, piece_type)
-            if not raw:
-                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason not_allowed_anchor)")
-                continue
-
-            rows = raw["carrier"]
-            A_raw, B_raw = raw["escapes"]
-
-            # Vérifs structurelles
-            if len(rows) != 9:
-                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason carrier_len={len(rows)})")
-                continue
-            if len(set(rows)) != 9:
-                # extraire les doublons
-                seen = set()
-                dups = []
-                for r in rows:
-                    if r in seen and r not in dups:
-                        dups.append(r)
-                    seen.add(r)
-                dups_an = [self._pos_to_an(r, n) for r in dups if 0 <= r[0] < n and 0 <= r[1] < n]
-                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason duplicates={dups_an})")
-                continue
-
-            # Vérif bornes
-            oob = [(ci, cj) for (ci, cj) in rows if not (0 <= ci < n and 0 <= cj < n)]
-            if oob:
-                oob_an = [self._pos_to_an(c, n) if (0 <= c[0] < n and 0 <= c[1] < n) else str(c) for c in oob]
-                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason out_of_bounds={oob_an})")
-                continue
-
-            # Vérif "état avant intrusion": tout vide sauf éventuellement last_pos (adversaire)
-            blockers = []
-            intruder_inside = False
-            for (ci, cj) in rows:
-                # Ignorer l'ancre (elle est à nous et peut être occupée)
-                if (ci, cj) == anchor:
+            tried_any = False
+            # Essayer les deux interprétations d'ancre: gauche puis droite
+            for a_side in ("L", "R"):
+                # Specs brutes (4-3-2) sans vérif bornes pour diagnostiquer précisément
+                raw = self._ziggurat_specs_raw(state, anchor, piece_type, a_side)
+                if not raw:
+                    if a_side == "L":
+                        print(f"[MyPlayer][zig] {anchor_an} no_specs (reason not_allowed_anchor)")
                     continue
-                occ = env.get((ci, cj))
-                occ_t = None
-                try:
-                    occ_t = occ.get_type() if occ is not None else None
-                except Exception:
+                tried_any = True
+
+                rows = raw["carrier"]
+                A_raw, B_raw = raw["escapes"]
+
+                # Vérifs structurelles
+                if len(rows) != 9:
+                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason carrier_len={len(rows)}) side={a_side}")
+                    continue
+                if len(set(rows)) != 9:
+                    # extraire les doublons
+                    seen = set()
+                    dups = []
+                    for r in rows:
+                        if r in seen and r not in dups:
+                            dups.append(r)
+                        seen.add(r)
+                    dups_an = [self._pos_to_an(r, n) for r in dups if 0 <= r[0] < n and 0 <= r[1] < n]
+                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason duplicates={dups_an}) side={a_side}")
+                    continue
+
+                # Vérif bornes
+                oob = [(ci, cj) for (ci, cj) in rows if not (0 <= ci < n and 0 <= cj < n)]
+                if oob:
+                    oob_an = [self._pos_to_an(c, n) if (0 <= c[0] < n and 0 <= c[1] < n) else str(c) for c in oob]
+                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason out_of_bounds={oob_an}) side={a_side}")
+                    continue
+
+                # Vérif "état avant intrusion": tout vide sauf éventuellement last_pos (adversaire)
+                blockers = []
+                intruder_inside = False
+                for (ci, cj) in rows:
+                    # Ignorer l'ancre (elle est à nous et peut être occupée)
+                    if (ci, cj) == anchor:
+                        continue
+                    occ = env.get((ci, cj))
                     occ_t = None
-                if (ci, cj) == last_pos:
-                    intruder_inside = (occ_t == opp_type)
-                elif occ_t is not None:
-                    blockers.append((ci, cj))
+                    try:
+                        occ_t = occ.get_type() if occ is not None else None
+                    except Exception:
+                        occ_t = None
+                    if (ci, cj) == last_pos:
+                        intruder_inside = (occ_t == opp_type)
+                    elif occ_t is not None:
+                        blockers.append((ci, cj))
 
-            if blockers:
-                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason not_empty={[self._pos_to_an(b, n) for b in blockers]})")
+                if blockers:
+                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason not_empty={[self._pos_to_an(b, n) for b in blockers]}) side={a_side}")
+                    continue
+                if not intruder_inside:
+                    # soit last_pos n'est pas dedans, soit ce n'est pas une pierre adverse
+                    inside = last_pos in rows
+                    reason = "last_pos_not_in_carrier" if not inside else "last_pos_not_opp"
+                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason {reason}) side={a_side}")
+                    continue
+
+                # Ici: ziggurat détecté avec intrusion
+                spec = {"orientation": raw["orientation"], "carrier": rows, "escapes": (A_raw, B_raw), "anchor_side": a_side}
+                A, B = spec["escapes"]
+                print(f"[MyPlayer] ziggurat_detect anchor={anchor_an} orient={spec['orientation']} side={a_side} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)})")
+
+                a_free = env.get(A) is None
+                b_free = env.get(B) is None
+                print(f"[MyPlayer][zig] escapes_free A={a_free} B={b_free}")
+
+                choice: Optional[tuple[int,int]] = None
+                orient = spec["orientation"]
+                side = self._classify_zig_with_orient(anchor, last_pos, orient, a_side)
+
+                # Règle générale: côté gauche => préférer B, côté droit => préférer A
+                if side == "left":
+                    pref = "B"
+                elif side == "right":
+                    pref = "A"
+                else:
+                    pref = None
+
+                print(f"[MyPlayer][zig] orient={orient} anchor_side={a_side} side={side} prefer={pref if pref else 'none'}")
+
+                if pref == "A":
+                    choice = A if a_free else (B if b_free else None)
+                elif pref == "B":
+                    choice = B if b_free else (A if a_free else None)
+                else:
+                    # Fallback: choisir l'escape la plus éloignée de l'intrus si les deux sont libres
+                    if a_free and b_free:
+                        li, lj = last_pos
+                        dA = abs(li - A[0]) + abs(lj - A[1])
+                        dB = abs(li - B[0]) + abs(lj - B[1])
+                        choice = A if dA > dB else B
+                    elif a_free:
+                        choice = A
+                    elif b_free:
+                        choice = B
+
+                if choice:
+                    print(f"[MyPlayer] ziggurat_intrusion anchor={anchor_an} orient={spec['orientation']} side={a_side} intruder={self._pos_to_an(last_pos, n)} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)}) choose={self._pos_to_an(choice, n)}")
+                    return choice
+
+            if not tried_any:
                 continue
-            if not intruder_inside:
-                # soit last_pos n'est pas dedans, soit ce n'est pas une pierre adverse
-                inside = last_pos in rows
-                reason = "last_pos_not_in_carrier" if not inside else "last_pos_not_opp"
-                print(f"[MyPlayer][zig] {anchor_an} no_specs (reason {reason})")
-                continue
-
-            # Ici: ziggurat détecté avec intrusion
-            spec = {"orientation": raw["orientation"], "carrier": rows, "escapes": (A_raw, B_raw)}
-            A, B = spec["escapes"]
-            print(f"[MyPlayer] ziggurat_detect anchor={anchor_an} orient={spec['orientation']} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)})")
-
-            a_free = env.get(A) is None
-            b_free = env.get(B) is None
-            print(f"[MyPlayer][zig] escapes_free A={a_free} B={b_free}")
-
-            choice: Optional[tuple[int,int]] = None
-            orient = spec["orientation"]
-            side = self._classify_zig_with_orient(anchor, last_pos, orient)
-
-            # Règle générale: côté gauche => préférer B, côté droit => préférer A
-            if side == "left":
-                pref = "B"
-            elif side == "right":
-                pref = "A"
-            else:
-                pref = None
-
-            print(f"[MyPlayer][zig] orient={orient} side={side} prefer={pref if pref else 'none'}")
-
-            if pref == "A":
-                choice = A if a_free else (B if b_free else None)
-            elif pref == "B":
-                choice = B if b_free else (A if a_free else None)
-            else:
-                # Fallback: choisir l'escape la plus éloignée de l'intrus si les deux sont libres
-                if a_free and b_free:
-                    li, lj = last_pos
-                    dA = abs(li - A[0]) + abs(lj - A[1])
-                    dB = abs(li - B[0]) + abs(lj - B[1])
-                    choice = A if dA > dB else B
-                elif a_free:
-                    choice = A
-                elif b_free:
-                    choice = B
-
-            if choice:
-                print(f"[MyPlayer] ziggurat_intrusion anchor={anchor_an} orient={spec['orientation']} intruder={self._pos_to_an(last_pos, n)} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)}) choose={self._pos_to_an(choice, n)}")
-                return choice
 
         print("[MyPlayer][zig] no ziggurat response found")
         return None
