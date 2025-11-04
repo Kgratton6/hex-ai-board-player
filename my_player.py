@@ -120,6 +120,10 @@ class MyPlayer(PlayerHex):
                 best_block = self._choose_best_from_candidates(st_hex, candidates)
                 if best_block:
                     print(f"[MyPlayer] must_block size={len(candidates)}")
+                    # Log si le coup posé forme un bridge (informationnelle)
+                    pos = best_block.data.get("position")
+                    if isinstance(pos, tuple):
+                        self._log_bridge_decision(st_hex, pos, source="must_block")
                     self._update_prev_positions(curr_pos_set, best_block)
                     return best_block
         
@@ -133,7 +137,6 @@ class MyPlayer(PlayerHex):
                 return best_bridge
         
         # PHASE 3: Ziggurat - réponse aux intrusions dans nos templates
-        print(f"[MyPlayer] ziggurat_phase start last_opp={self._pos_to_an(last_pos, n) if last_pos else 'None'}")
         ziggurat_response = self._ziggurat_intrusion_response(st_hex, self.piece_type, last_pos)
         if ziggurat_response:
             actions = list(state.get_possible_light_actions())
@@ -141,10 +144,12 @@ class MyPlayer(PlayerHex):
             if candidates:
                 best_zig = candidates[0]
                 print(f"[MyPlayer] ziggurat_response={self._pos_to_an(ziggurat_response, n)}")
+                # Log si le coup posé forme un bridge (informationnelle)
+                pos = best_zig.data.get("position")
+                if isinstance(pos, tuple):
+                    self._log_bridge_decision(st_hex, pos, source="ziggurat")
                 self._update_prev_positions(curr_pos_set, best_zig)
                 return best_zig
-        else:
-            print("[MyPlayer] ziggurat_phase no_response")
 
         # PHASE 4: Edge reduce (réduction 2→1 vers bord)
         edge21_moves = self._edge_reduce_rank2_to_rank1_for_player(st_hex, self.piece_type)
@@ -157,8 +162,11 @@ class MyPlayer(PlayerHex):
                     pos = best_edge21.data.get("position")
                     if isinstance(pos, tuple):
                         print(f"[MyPlayer] edge_reduce_2to1={self._pos_to_an(pos, n)}")
-                    self._update_prev_positions(curr_pos_set, best_edge21)
-                    return best_edge21
+                        # Log si le coup posé forme un bridge (informationnelle)
+                        if isinstance(pos, tuple):
+                            self._log_bridge_decision(st_hex, pos, source="edge_2to1")
+                        self._update_prev_positions(curr_pos_set, best_edge21)
+                        return best_edge21
 
         # PHASE 5: Edge reduce (réduction 3→2)
         edge_moves = self._edge_reduce_for_player(st_hex, self.piece_type)
@@ -171,8 +179,11 @@ class MyPlayer(PlayerHex):
                     pos = best_edge.data.get("position")
                     if isinstance(pos, tuple):
                         print(f"[MyPlayer] edge_reduce_3to2={self._pos_to_an(pos, n)}")
-                    self._update_prev_positions(curr_pos_set, best_edge)
-                    return best_edge
+                        # Log si le coup posé forme un bridge (informationnelle)
+                        if isinstance(pos, tuple):
+                            self._log_bridge_decision(st_hex, pos, source="edge_3to2")
+                        self._update_prev_positions(curr_pos_set, best_edge)
+                        return best_edge
 
         # PHASE 6: Edge double-threat (rang 2 → 2 gagnants en rang 1)
         edge_threats = self._edge_double_threat_from_last_move(st_hex, last_pos)
@@ -183,6 +194,10 @@ class MyPlayer(PlayerHex):
                 best_et = self._choose_best_from_candidates(st_hex, candidates)
                 if best_et:
                     print(f"[MyPlayer] edge_double_threat size={len(candidates)}")
+                    # Log si le coup posé forme un bridge (informationnelle)
+                    pos = best_et.data.get("position")
+                    if isinstance(pos, tuple):
+                        self._log_bridge_decision(st_hex, pos, source="edge_double_threat")
                     self._update_prev_positions(curr_pos_set, best_et)
                     return best_et
 
@@ -192,6 +207,10 @@ class MyPlayer(PlayerHex):
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         print(f"[MyPlayer] nodes={self._nodes_visited} time_ms={elapsed_ms:.1f} depth={self._depth_reached}")
         
+        # Log si le coup final forme un bridge (informationnelle)
+        pos = best_action.data.get("position")
+        if isinstance(pos, tuple):
+            self._log_bridge_decision(st_hex, pos, source="ids")
         self._update_prev_positions(curr_pos_set, best_action)
         return best_action
 
@@ -842,17 +861,17 @@ class MyPlayer(PlayerHex):
  
         p = env.get(anchor)
         if not p or p.get_type() != piece_type:
-            print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} fail=anchor_not_ally")
+            # ziggurat debug removed
             return False
  
         spec = self._ziggurat_specs(state, anchor, piece_type)
         if not spec:
-            print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} fail=no_specs")
+            # ziggurat debug removed
             return False
  
         carrier = spec["carrier"]
         A, B = spec["escapes"]
-        print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} orient={spec['orientation']} carrier_len={len(carrier)} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)})")
+        # ziggurat debug removed
         if len(carrier) != 9 or len(set(carrier)) != 9:
             print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} fail=carrier_len_or_duplicates")
             return False
@@ -866,16 +885,16 @@ class MyPlayer(PlayerHex):
                 occ_t = occ.get_type() if occ is not None else None
             except Exception:
                 occ_t = None
-            print(f"[MyPlayer][zig-detect] cell={self._pos_to_an((ci,cj), n) if inb else (ci,cj)} inb={inb} occ={'EMPTY' if occ_t is None else occ_t}")
+            # ziggurat debug removed
             if not inb:
                 ok = False
             elif (ci, cj) != anchor and occ_t is not None:
                 ok = False
         if not ok:
-            print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} result=blocked_or_oob")
+            # ziggurat debug removed
             return False
  
-        print(f"[MyPlayer][zig-detect] anchor={self._pos_to_an(anchor, n)} result=valid")
+        # ziggurat debug removed
         return True
  
     def _get_ziggurat_escape_cells(self, anchor: tuple[int,int], piece_type: str) -> tuple[tuple[int,int], tuple[int,int]]:
@@ -993,10 +1012,10 @@ class MyPlayer(PlayerHex):
         n = rep.get_dimensions()[0]
 
         if not last_pos:
-            print("[MyPlayer][zig] skip: no last_pos")
+            # ziggurat debug removed
             return None
 
-        print(f"[MyPlayer][zig] last_opp={self._pos_to_an(last_pos, n)} piece_type={piece_type}")
+        # ziggurat debug removed
         opp_type = "B" if piece_type == "R" else "R"
         p = env.get(last_pos)
         if not p or p.get_type() != opp_type:
@@ -1015,7 +1034,7 @@ class MyPlayer(PlayerHex):
                 anchors.append((i, j))
             elif piece_type == "R" and (i == 2 or i == n - 3):
                 anchors.append((i, j))
-        print(f"[MyPlayer][zig] anchors_candidates={len(anchors)} list={[self._pos_to_an(a, n) for a in anchors]}")
+        # ziggurat debug removed
 
         for anchor in anchors:
             anchor_an = self._pos_to_an(anchor, n)
@@ -1036,7 +1055,7 @@ class MyPlayer(PlayerHex):
 
                 # Vérifs structurelles
                 if len(rows) != 9:
-                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason carrier_len={len(rows)}) side={a_side}")
+                    # ziggurat debug removed
                     continue
                 if len(set(rows)) != 9:
                     # extraire les doublons
@@ -1047,14 +1066,14 @@ class MyPlayer(PlayerHex):
                             dups.append(r)
                         seen.add(r)
                     dups_an = [self._pos_to_an(r, n) for r in dups if 0 <= r[0] < n and 0 <= r[1] < n]
-                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason duplicates={dups_an}) side={a_side}")
+                    # ziggurat debug removed
                     continue
 
                 # Vérif bornes
                 oob = [(ci, cj) for (ci, cj) in rows if not (0 <= ci < n and 0 <= cj < n)]
                 if oob:
                     oob_an = [self._pos_to_an(c, n) if (0 <= c[0] < n and 0 <= c[1] < n) else str(c) for c in oob]
-                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason out_of_bounds={oob_an}) side={a_side}")
+                    # ziggurat debug removed
                     continue
 
                 # Vérif "état avant intrusion": tout vide sauf éventuellement last_pos (adversaire)
@@ -1076,23 +1095,23 @@ class MyPlayer(PlayerHex):
                         blockers.append((ci, cj))
 
                 if blockers:
-                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason not_empty={[self._pos_to_an(b, n) for b in blockers]}) side={a_side}")
+                    # ziggurat debug removed
                     continue
                 if not intruder_inside:
                     # soit last_pos n'est pas dedans, soit ce n'est pas une pierre adverse
                     inside = last_pos in rows
                     reason = "last_pos_not_in_carrier" if not inside else "last_pos_not_opp"
-                    print(f"[MyPlayer][zig] {anchor_an} no_specs (reason {reason}) side={a_side}")
+                    # ziggurat debug removed
                     continue
 
                 # Ici: ziggurat détecté avec intrusion
                 spec = {"orientation": raw["orientation"], "carrier": rows, "escapes": (A_raw, B_raw), "anchor_side": a_side}
                 A, B = spec["escapes"]
-                print(f"[MyPlayer] ziggurat_detect anchor={anchor_an} orient={spec['orientation']} side={a_side} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)})")
+                # ziggurat debug removed
 
                 a_free = env.get(A) is None
                 b_free = env.get(B) is None
-                print(f"[MyPlayer][zig] escapes_free A={a_free} B={b_free}")
+                # ziggurat debug removed
 
                 choice: Optional[tuple[int,int]] = None
                 orient = spec["orientation"]
@@ -1106,7 +1125,7 @@ class MyPlayer(PlayerHex):
                 else:
                     pref = None
 
-                print(f"[MyPlayer][zig] orient={orient} anchor_side={a_side} side={side} prefer={pref if pref else 'none'}")
+                # ziggurat debug removed
 
                 if pref == "A":
                     choice = A if a_free else (B if b_free else None)
@@ -1125,13 +1144,13 @@ class MyPlayer(PlayerHex):
                         choice = B
 
                 if choice:
-                    print(f"[MyPlayer] ziggurat_intrusion anchor={anchor_an} orient={spec['orientation']} side={a_side} intruder={self._pos_to_an(last_pos, n)} escapes=({self._pos_to_an(A, n)},{self._pos_to_an(B, n)}) choose={self._pos_to_an(choice, n)}")
+                    # ziggurat debug removed (return choice)
                     return choice
 
             if not tried_any:
                 continue
 
-        print("[MyPlayer][zig] no ziggurat response found")
+        # ziggurat debug removed
         return None
  
     def _ziggurat_formation_bonus(self, state: GameStateHex, pos: tuple[int,int]) -> float:
@@ -1404,6 +1423,31 @@ class MyPlayer(PlayerHex):
         
         return out
 
+    def _log_bridge_decision(self, state: GameStateHex, pos: tuple[int,int], source: str) -> None:
+        """Log léger si le coup pos forme un bridge (create/complete) selon _bridge_creation_info."""
+        try:
+            info = self._bridge_creation_info(state, self.piece_type, pos)
+            if not info:
+                return
+            # Choisir une entrée “complete” en priorité, sinon la première
+            entry = None
+            for holes, ally, is_comp in info:
+                if is_comp:
+                    entry = (holes, ally, is_comp)
+                    break
+            if entry is None:
+                entry = info[0]
+            holes, ally, is_comp = entry
+            rep = cast(BoardHex, state.get_rep())
+            n = rep.get_dimensions()[0]
+            holes_an = [self._pos_to_an(h, n) for h in holes]
+            ally_an = self._pos_to_an(ally, n)
+            pos_an = self._pos_to_an(pos, n)
+            kind = "complete" if is_comp else "create"
+            print(f"[MyPlayer] bridge posé kind={kind} pos={pos_an} ally={ally_an} holes={holes_an} source={source}")
+        except Exception:
+            pass
+
     def _bridge_guided_bonus(self, state: GameStateHex, pos: tuple[int,int], spine: list[tuple[int,int]]) -> float:
         """P3.2: Bonus épine + bridges + gradient"""
         if not (isinstance(pos, tuple) and len(pos) == 2):
@@ -1429,12 +1473,23 @@ class MyPlayer(PlayerHex):
             BRIDGE_COMPLETE = 0.40
             BRIDGE_CREATE = 0.25
             best = 0.0
+            best_entry = None
             for holes, ally, is_comp in info:
                 near = min(self._dist_to_spine(h, spine) for h in holes) <= 1
                 if near:
                     cand = BRIDGE_COMPLETE if is_comp else BRIDGE_CREATE
                     if cand > best:
                         best = cand
+                        best_entry = (holes, ally, is_comp)
+            if best_entry is not None and best > 0.0:
+                # Log discret: _bridge_creation_info a contribué au score
+                rep = cast(BoardHex, state.get_rep())
+                n = rep.get_dimensions()[0]
+                holes_an = [self._pos_to_an(h, n) for h in best_entry[0]]
+                ally_an = self._pos_to_an(best_entry[1], n)
+                pos_an = self._pos_to_an(pos, n)
+                kind = "complete" if best_entry[2] else "create"
+                print(f"[MyPlayer] bridge_bonus pos={pos_an} kind={kind} bonus={best:.2f} holes={holes_an} ally={ally_an}")
             return best + proximity + gradient
         
         return proximity + gradient
