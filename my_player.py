@@ -94,23 +94,6 @@ class MyPlayer(PlayerHex):
         if last_pos:
             print(f"[MyPlayer] last_opp={self._pos_to_an(last_pos, n)}")
 
-        # Ouverture forcée temporaire: jouer C7 à NOTRE premier coup (même si l'adversaire a déjà joué)
-        # C7 => (i,j) = (6,2) en notation interne (0-index)
-        try:
-            my_type = self.piece_type
-            my_count = sum(1 for p in env.values() if p.get_type() == my_type)
-        except Exception:
-            my_count = 0
-        if my_count == 0:
-            forced = (6, 2)
-            if env.get(forced) is None:
-                actions = list(state.get_possible_light_actions())
-                forced_cand = next((a for a in actions if a.data.get("position") == forced), None)
-                if forced_cand:
-                    print("[MyPlayer] forced_open=C7")
-                    self._update_prev_positions(curr_pos_set, forced_cand)
-                    return forced_cand
-        
         # PHASE 1: Must-block (gagne en 1 coup)
         threats = self._must_block_cells(st_hex)
         if threats:
@@ -203,6 +186,44 @@ class MyPlayer(PlayerHex):
 
         # PHASE 6: IDS + Alpha-bêta avec toutes les optimisations
         best_action = self._iterative_deepening_search(st_hex, last_pos)
+        
+        # Tie-break racine en faveur d'un bridge (epsilon 0.02), si pas de must-block
+        try:
+            epsilon = 0.02
+            if not self._must_block_cells(st_hex):
+                actions_all = list(state.get_possible_light_actions())
+                child_best = cast(GameStateHex, st_hex.apply_action(best_action))
+                best_val_est = self._evaluate(child_best)
+                prefer = None
+                prefer_val = float("-inf")
+                prefer_kind: Optional[str] = None
+                # Préférer d'abord 'create' puis la meilleure valeur
+                def prio_tuple(kind: Optional[str], val: float) -> tuple[int, float]:
+                    return (1 if kind == "create" else 0, val)
+                for a in actions_all:
+                    pos_a = a.data.get("position")
+                    if not (isinstance(pos_a, tuple) and len(pos_a) == 2):
+                        continue
+                    child_a = cast(GameStateHex, st_hex.apply_action(a))
+                    v = self._evaluate(child_a)
+                    if v + epsilon < best_val_est:
+                        continue
+                    kind = self._classify_bridge_move(st_hex, pos_a)
+                    if kind is None:
+                        continue
+                    if prefer is None or prio_tuple(kind, v) > prio_tuple(prefer_kind, prefer_val):
+                        prefer = a
+                        prefer_val = v
+                        prefer_kind = kind
+                if prefer is not None and prefer != best_action:
+                    rep = cast(BoardHex, st_hex.get_rep())
+                    n = rep.get_dimensions()[0]
+                    ppos = prefer.data.get("position")
+                    if isinstance(ppos, tuple):
+                        print(f"[MyPlayer] bridge_tiebreak={self._pos_to_an(ppos, n)} kind={prefer_kind} eps={epsilon}")
+                    best_action = prefer
+        except Exception:
+            pass
         
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         print(f"[MyPlayer] nodes={self._nodes_visited} time_ms={elapsed_ms:.1f} depth={self._depth_reached}")
@@ -1378,12 +1399,11 @@ class MyPlayer(PlayerHex):
         
         i, j = pos
         patterns = [
-            ((+1,+1), [(0,+1),(+1,0)]),
-            ((-1,-1), [(-1,0),(0,-1)]),
-            ((+1,-1), [(0,-1),(+1,0)]),
-            ((-1,+1), [(-1,0),(0,+1)]),
-            ((+2,-1), [(+1,0),(+1,-1)]),
-            ((-2,+1), [(-1,0),(-1,+1)]),
+            # Seules paires non-voisines (véritables “bridges”)
+            ((+1,+1), [(0,+1),(+1,0)]),      # diamant nord-est
+            ((-1,-1), [(-1,0),(0,-1)]),      # diamant sud-ouest
+            ((+2,-1), [(+1,0),(+1,-1)]),     # diamant sud-est
+            ((-2,+1), [(-1,0),(-1,+1)]),     # diamant nord-ouest
         ]
         
         def inb(x, y):
@@ -1489,7 +1509,6 @@ class MyPlayer(PlayerHex):
                 ally_an = self._pos_to_an(best_entry[1], n)
                 pos_an = self._pos_to_an(pos, n)
                 kind = "complete" if best_entry[2] else "create"
-                print(f"[MyPlayer] bridge_bonus pos={pos_an} kind={kind} bonus={best:.2f} holes={holes_an} ally={ally_an}")
             return best + proximity + gradient
         
         return proximity + gradient
@@ -1564,6 +1583,18 @@ class MyPlayer(PlayerHex):
         presence_term = self._edge_presence_score(state, my_type) - self._edge_presence_score(state, opp_type)
         
         val = 0.25 * piece_diff + 0.35 * anchor_term + 0.20 * presence_term + 0.15 * center_term + 0.05 * cluster_term
+
+        # Petit terme bridge (doux): +0.05 créer, +0.01 compléter, seulement si trous libres et pas de must-block
+        try:
+            if not self._must_block_cells(state):
+                has_create, has_complete = self._bridge_eval_flags(state, my_type)
+                if has_create:
+                    val += 0.10
+                if has_complete:
+                    val += 0.01
+        except Exception:
+            pass
+
         return max(-0.9, min(0.9, val))
 
     def _root_order_score(self, state: GameStateHex) -> float:
@@ -1717,6 +1748,95 @@ class MyPlayer(PlayerHex):
                         consider_pair(hole_pair[0], hole_pair[1])
         
         return holes
+
+    def _bridge_eval_flags(self, state: GameStateHex, piece_type: str) -> tuple[bool, bool]:
+        """Détecte la présence d'au moins un motif bridge côté 'piece_type'.
+        Retourne (has_create, has_complete):
+          - create: 2 trous vides pour un couple allié non-voisin (diamant)
+          - complete: 1 trou vide et 1 trou déjà allié
+        """
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+
+        def inb(i: int, j: int) -> bool:
+            return 0 <= i < n and 0 <= j < n
+
+        has_create = False
+        has_complete = False
+
+        # Offsets B - A pour les 4 diamants et trous relatifs à A
+        patterns: list[tuple[int,int,list[tuple[int,int]]]] = [
+            (+1, +1, [(0, +1), (+1, 0)]),
+            (-1, -1, [(-1, 0), (0, -1)]),
+            (+2, -1, [(+1, 0), (+1, -1)]),
+            (-2, +1, [(-1, 0), (-1, +1)]),
+        ]
+
+        for (ai, aj), pA in env.items():
+            try:
+                if pA.get_type() != piece_type:
+                    continue
+            except Exception:
+                continue
+            for dx, dy, holes_rel in patterns:
+                bi, bj = ai + dx, aj + dy
+                if not inb(bi, bj):
+                    continue
+                pB = env.get((bi, bj))
+                if not pB or pB.get_type() != piece_type:
+                    continue
+                holes: list[tuple[int,int]] = []
+                for hr in holes_rel:
+                    hi, hj = ai + hr[0], aj + hr[1]
+                    if inb(hi, hj):
+                        holes.append((hi, hj))
+                if len(holes) != 2:
+                    continue
+                occ_types: list[Optional[str]] = []
+                for h in holes:
+                    q = env.get(h)
+                    try:
+                        occ_types.append(q.get_type() if q is not None else None)
+                    except Exception:
+                        occ_types.append(None)
+                empties = [t is None for t in occ_types]
+                allies = [t == piece_type for t in occ_types]
+                if empties[0] and empties[1]:
+                    has_create = True
+                elif (empties[0] and allies[1]) or (empties[1] and allies[0]):
+                    has_complete = True
+                if has_create and has_complete:
+                    return True, True
+
+        return has_create, has_complete
+
+    def _classify_bridge_move(self, state: GameStateHex, pos: tuple[int,int]) -> Optional[str]:
+        """Classe 'pos' sur l'état courant: 'create' si deux trous vides, 'complete' si 1 vide et 1 allié; sinon None."""
+        try:
+            info = self._bridge_creation_info(state, self.piece_type, pos)
+            if not info:
+                return None
+            rep = cast(BoardHex, state.get_rep())
+            env = rep.get_env()
+            for holes, ally, is_comp in info:
+                hs = list(holes)
+                occ_types: list[Optional[str]] = []
+                for h in hs:
+                    q = env.get(h)
+                    try:
+                        occ_types.append(q.get_type() if q is not None else None)
+                    except Exception:
+                        occ_types.append(None)
+                empties = [t is None for t in occ_types]
+                allies = [t == self.piece_type for t in occ_types]
+                if empties[0] and empties[1]:
+                    return "create"
+                if (allies[0] and empties[1]) or (allies[1] and empties[0]):
+                    return "complete"
+            return None
+        except Exception:
+            return None
 
     def _friendly_neighbors_count(self, state: GameStateHex, pos: tuple[int,int], piece_type: str) -> int:
         """Nombre de voisins alliés"""
