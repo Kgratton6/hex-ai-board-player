@@ -1,4 +1,4 @@
-from typing import Optional, cast, Any
+from typing import Optional, cast
 import random
 import time
 import heapq
@@ -14,13 +14,16 @@ from board_hex import BoardHex
 class MyPlayer(PlayerHex):
     """
     Agent Hex avec:
-    - P0-P4: Alpha-bêta, H1 (distance+centre), ordering racine, bridge réactif
-    - P3.2: Épine dorsale (spine) + bonus bridges guidés + gradient
-    - P5: Réduction de bord 3→2
-    - P6: Filtrage dead cells
-    - P7: Must-play de couloir
-    - P9: IDS (Iterative Deepening Search)
-    - P10: Table de transposition (Zobrist)
+    - Recherche: IDS + alpha-bêta + table de transposition (Zobrist)
+    - Évaluation H1: distance adverse priorisée + urgence, plus évaluation statique rapide
+    - Ordonnancement racine/profond: Δd_opp, épine (spine), bridges, gradient, front-cap
+    - Filtrage P6: suppression des coups morts, conservation des tactiques (must-block, trous de bridge)
+    - Bridges: détection création/complétion, réponses réactives aux intrusions, logs dédiés
+    - Épine dorsale (spine) + gradient de distance pour guider l’ouverture/milieu
+    - Émulation adverse: blocage p_best vs front-cap (maximise d_opp), advance2, forcing après série de near-blocks
+    - Réductions de bord: 2→1 et 3→2
+    - Ziggurat: détection et réponse aux intrusions, léger bonus de formation
+    - Journalisation: top-K ordering, choix final, menaces, etc., et gestion stricte du budget temps par coup
     """
 
     def __init__(self, piece_type: str, name: str = "MyPlayer", max_depth: int = 4):
@@ -32,7 +35,15 @@ class MyPlayer(PlayerHex):
         self._depth_reached = 0
         self._deadline: float = float("inf")
         self._prev_positions: set[tuple[int, int]] = set()
-        
+        self._consecutive_near_blocks: int = 0
+
+        # Debug/trace
+        self._debug: bool = True
+        self._root_log_top_k: int = 6
+
+        # Stratégie: forcer advance2 même si une menace immediate existe (peut être risqué)
+        self._force_advance2_even_if_threat: bool = True
+         
         # Table de transposition (Zobrist)
         self._tt: dict[int, tuple[float, int, str, Optional[tuple[int,int]]]] = {}
         self._zobrist_table: dict[tuple[str, int, int], int] = {}
@@ -94,11 +105,21 @@ class MyPlayer(PlayerHex):
         if last_pos:
             print(f"[MyPlayer] last_opp={self._pos_to_an(last_pos, n)}")
 
-        # PHASE 1: Must-block (gagne en 1 coup)
+        # PHASE 0: Must-block (gagne en 1 coup)
         threats = self._must_block_cells(st_hex)
         if threats:
             actions = list(state.get_possible_light_actions())
             candidates = [a for a in actions if a.data.get("position") in threats]
+            if self._debug:
+                rep_dbg = cast(BoardHex, st_hex.get_rep())
+                n_dbg = rep_dbg.get_dimensions()[0]
+                threats_an = sorted([self._pos_to_an(t, n_dbg) for t in threats])
+                cands_an_list: list[str] = []
+                for c in candidates:
+                    p = c.data.get("position")
+                    if isinstance(p, tuple) and len(p) == 2:
+                        cands_an_list.append(self._pos_to_an(p, n_dbg))
+                print(f"[MyPlayer][must] threats={threats_an} cand={sorted(cands_an_list)} size={len(candidates)}")
             if candidates:
                 best_block = self._choose_best_from_candidates(st_hex, candidates)
                 if best_block:
@@ -108,8 +129,19 @@ class MyPlayer(PlayerHex):
                     if isinstance(pos, tuple):
                         self._log_bridge_decision(st_hex, pos, source="must_block")
                     self._update_prev_positions(curr_pos_set, best_block)
+                    # must_block compte comme un near-block
+                    self._consecutive_near_blocks += 1
+                    if self._debug:
+                        print(f"[MyPlayer][streak] near-block={self._consecutive_near_blocks}")
                     return best_block
         
+        # PHASE 1: Advance2 forcé après 3 near-block consécutifs (sécurisé)
+        forced = self._forced_advance2_if_needed(st_hex, last_pos)
+        if forced is not None:
+            self._update_prev_positions(curr_pos_set, forced)
+            self._consecutive_near_blocks = 0
+            return forced
+
         # PHASE 2: Bridge réactif
         replies = self._bridge_intrusion_replies(st_hex, self.piece_type, last_pos)
         if replies:
@@ -117,27 +149,39 @@ class MyPlayer(PlayerHex):
             best_bridge = self._handle_bridge_replies(st_hex, replies, actions)
             if best_bridge:
                 self._update_prev_positions(curr_pos_set, best_bridge)
+                self._consecutive_near_blocks = 0
                 return best_bridge
-        
-        # PHASE 3: Ziggurat - réponse aux intrusions dans nos templates
-        ziggurat_response = self._ziggurat_intrusion_response(st_hex, self.piece_type, last_pos)
-        if ziggurat_response:
-            actions = list(state.get_possible_light_actions())
-            candidates = [a for a in actions if a.data.get("position") == ziggurat_response]
-            if candidates:
-                best_zig = candidates[0]
-                print(f"[MyPlayer] ziggurat_response={self._pos_to_an(ziggurat_response, n)}")
-                # Log si le coup posé forme un bridge (informationnelle)
-                pos = best_zig.data.get("position")
-                if isinstance(pos, tuple):
-                    self._log_bridge_decision(st_hex, pos, source="ziggurat")
-                self._update_prev_positions(curr_pos_set, best_zig)
-                return best_zig
 
-        # PHASE 4-5: Edge reduce (différés jusqu'à la fin d'ouverture)
+        # PHASE 3: Emulation de l'adversaire (bloquer/avancer)
+        emu_action = self._adversary_emulation_response(st_hex, last_pos)
+        if emu_action:
+            self._update_prev_positions(curr_pos_set, emu_action)
+            return emu_action
+        else:
+            # Pas d'action d'émulation: on réinitialise la série de near-block
+            self._consecutive_near_blocks = 0
+
+        # PHASE 4+: Ziggurat/Edge reduce (différés jusqu'à la fin d'ouverture)
         total_stones = len(env)
-        if total_stones >= 10:
-            # PHASE 4: Edge reduce (réduction 2→1 vers bord)
+        if total_stones >= 30:        
+            # PHASE 4: Ziggurat - réponse aux intrusions dans nos templates
+            ziggurat_response = self._ziggurat_intrusion_response(st_hex, self.piece_type, last_pos)
+            if ziggurat_response:
+                actions = list(state.get_possible_light_actions())
+                candidates = [a for a in actions if a.data.get("position") == ziggurat_response]
+                if candidates:
+                    best_zig = candidates[0]
+                    print(f"[MyPlayer] ziggurat_response={self._pos_to_an(ziggurat_response, n)}")
+                    # Log si le coup posé forme un bridge (informationnelle)
+                    pos = best_zig.data.get("position")
+                    if isinstance(pos, tuple):
+                        self._log_bridge_decision(st_hex, pos, source="ziggurat")
+                    self._update_prev_positions(curr_pos_set, best_zig)
+                    self._consecutive_near_blocks = 0
+                    return best_zig
+
+
+            # PHASE 5: Edge reduce (réduction 2→1 vers bord)
             edge21_moves = self._edge_reduce_rank2_to_rank1_for_player(st_hex, self.piece_type)
             if edge21_moves:
                 actions = list(state.get_possible_light_actions())
@@ -152,9 +196,10 @@ class MyPlayer(PlayerHex):
                             if isinstance(pos, tuple):
                                 self._log_bridge_decision(st_hex, pos, source="edge_2to1")
                             self._update_prev_positions(curr_pos_set, best_edge21)
+                            self._consecutive_near_blocks = 0
                             return best_edge21
 
-            # PHASE 5: Edge reduce (réduction 3→2)
+            # PHASE 6: Edge reduce (réduction 3→2)
             edge_moves = self._edge_reduce_for_player(st_hex, self.piece_type)
             if edge_moves:
                 actions = list(state.get_possible_light_actions())
@@ -169,10 +214,11 @@ class MyPlayer(PlayerHex):
                             if isinstance(pos, tuple):
                                 self._log_bridge_decision(st_hex, pos, source="edge_3to2")
                             self._update_prev_positions(curr_pos_set, best_edge)
+                            self._consecutive_near_blocks = 0
                             return best_edge
 
-        # PHASE 6: (supprimé) ancien edge double-threat; remplacé prochainement par le module Blocking
-        # PHASE 6: IDS + Alpha-bêta avec toutes les optimisations
+        # (supprimé) ancien edge double-threat
+        # PHASE 7: IDS + Alpha-bêta avec toutes les optimisations
         best_action = self._iterative_deepening_search(st_hex, last_pos)
         
         # Tie-break racine en faveur d'un bridge (epsilon 0.02), si pas de must-block
@@ -216,11 +262,29 @@ class MyPlayer(PlayerHex):
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         print(f"[MyPlayer] nodes={self._nodes_visited} time_ms={elapsed_ms:.1f} depth={self._depth_reached}")
         
+        # Log delta distances pour le coup choisi
+        try:
+            my_t = self.piece_type
+            opp_t = "B" if my_t == "R" else "R"
+            d_opp0 = self._connection_distance(st_hex, opp_t)
+            d_my0 = self._connection_distance(st_hex, my_t)
+            child_final = cast(GameStateHex, st_hex.apply_action(best_action))
+            d_opp1 = self._connection_distance(child_final, opp_t)
+            d_my1 = self._connection_distance(child_final, my_t)
+            pos_dbg = best_action.data.get("position")
+            if isinstance(pos_dbg, tuple):
+                n_dbg = cast(BoardHex, st_hex.get_rep()).get_dimensions()[0]
+                an = self._pos_to_an(pos_dbg, n_dbg)
+                print(f"[MyPlayer][choice] {an} d_opp:{d_opp0}->{d_opp1} (Δ{d_opp1 - d_opp0:+}) d_my:{d_my0}->{d_my1} (Δ{d_my1 - d_my0:+})")
+        except Exception:
+            pass
+
         # Log si le coup final forme un bridge (informationnelle)
         pos = best_action.data.get("position")
         if isinstance(pos, tuple):
             self._log_bridge_decision(st_hex, pos, source="ids")
         self._update_prev_positions(curr_pos_set, best_action)
+        self._consecutive_near_blocks = 0
         return best_action
 
     def _iterative_deepening_search(self, state: GameStateHex, last_pos: Optional[tuple[int,int]]) -> LightAction:
@@ -345,7 +409,7 @@ class MyPlayer(PlayerHex):
             return value
 
     def _filter_dead_cells(self, state: GameStateHex, actions: list[LightAction], last_pos: Optional[tuple[int,int]]) -> list[LightAction]:
-        """P6: Filtrage des coups morts (coins, zones scellées)"""
+        """P6: Filtrage des coups morts (coins, zones scellées) + log de répartition des raisons."""
         rep = cast(BoardHex, state.get_rep())
         n = rep.get_dimensions()[0]
         
@@ -358,7 +422,10 @@ class MyPlayer(PlayerHex):
         curr_dist = self._connection_distance(state, self.piece_type)
         opp_dist = self._connection_distance(state, opp_type)
         
-        filtered = []
+        filtered: list[LightAction] = []
+        # Compteurs pour logs
+        c_threat = c_holes = c_center = c_front = c_dopp = c_dmy = 0
+        
         for a in actions:
             pos = a.data.get("position")
             if not (isinstance(pos, tuple) and len(pos) == 2):
@@ -367,98 +434,457 @@ class MyPlayer(PlayerHex):
             i, j = pos
             
             # Garder si tactique
-            if pos in threats or pos in opp_bridge_holes or pos in my_bridge_holes:
-                filtered.append(a)
+            if pos in threats:
+                filtered.append(a); c_threat += 1
+                continue
+            if pos in opp_bridge_holes or pos in my_bridge_holes:
+                filtered.append(a); c_holes += 1
                 continue
             
             # Garder si zone centrale (pas dans les coins extrêmes)
             if 2 <= i < n-2 and 2 <= j < n-2:
-                filtered.append(a)
+                filtered.append(a); c_center += 1
                 continue
             
             # Garder si améliore notre distance ou dégrade la leur
             child = cast(GameStateHex, state.apply_action(a))
             new_my_dist = self._connection_distance(child, self.piece_type)
             new_opp_dist = self._connection_distance(child, opp_type)
-            
-            if new_my_dist < curr_dist or new_opp_dist > opp_dist:
-                filtered.append(a)
+
+            # Garder si "cap frontal": voisin immédiat du dernier coup adverse dans sa direction de connexion
+            is_front = False
+            if last_pos:
+                li, lj = last_pos
+                # voisin immédiat
+                neigh = False
+                for _, (ni, nj) in state.get_neighbours(li, lj).values():
+                    if (ni, nj) == pos:
+                        neigh = True
+                        break
+                if neigh:
+                    if opp_type == "R":  # l'adversaire vise verticalement
+                        forward = (pos[0] >= li) if li < (n // 2) else (pos[0] <= li)
+                        lateral = abs(pos[1] - lj) <= 1
+                    else:  # l'adversaire vise horizontalement
+                        forward = (pos[1] >= lj) if lj < (n // 2) else (pos[1] <= lj)
+                        lateral = abs(pos[0] - li) <= 1
+                    is_front = forward and lateral
+            if is_front:
+                filtered.append(a); c_front += 1
+                continue
+
+            # Privilégier les coups qui augmentent la distance adverse (au moins +1) ou qui réduisent la nôtre
+            if new_opp_dist >= opp_dist + 1:
+                filtered.append(a); c_dopp += 1
+                continue
+            if new_my_dist < curr_dist:
+                filtered.append(a); c_dmy += 1
                 continue
         
+        if self._debug:
+            print(f"[MyPlayer][filter] kept={len(filtered)}/{len(actions)} reasons center={c_center} threat={c_threat} holes={c_holes} front={c_front} +Δopp={c_dopp} -d_my={c_dmy}")
         return filtered if filtered else actions
 
     def _order_actions_with_spine(self, state: GameStateHex, actions: list[LightAction], last_pos: Optional[tuple[int,int]]) -> list[LightAction]:
-        """P3.2: Ordonnancement avec épine dorsale, bridges, gradient"""
+        """Ordonnancement racine: priorise fortement l'augmentation de la distance adverse + épine/bridges/gradient.
+           Ajoute des logs détaillés (top-K) pour diagnostiquer le non-blocage.
+        """
         rep = cast(BoardHex, state.get_rep())
         n = rep.get_dimensions()[0]
-        
-        # Calcul de l'épine dorsale
+
+        # Épine dorsale pour bonus de guidage
         spine = self._guiding_spine(state, self.piece_type)
-        
+
         # Pré-calculs
-        opp_type = "B" if self.piece_type == "R" else "R"
+        my_type = self.piece_type
+        opp_type = "B" if my_type == "R" else "R"
         opp_bridge_holes = self._bridge_holes(state, opp_type)
-        curr_dist = self._connection_distance(state, self.piece_type)
-        border_reduce = self._border_reduce_candidates_from_actions(state, self.piece_type, curr_dist, actions)
-        
-        # Score chaque action
-        scored = []
+        my_dist0 = self._connection_distance(state, my_type)
+        opp_dist0 = self._connection_distance(state, opp_type)
+        border_reduce = self._border_reduce_candidates_from_actions(state, my_type, my_dist0, actions)
+        urgency = 1.0 + max(0, 10 - opp_dist0) * 0.25
+
+        # Helper frontal simple (sans module dédié): voisin de last_pos orienté vers le bord cible adverse
+        def is_front_cap(p: tuple[int,int]) -> bool:
+            if not last_pos:
+                return False
+            li, lj = last_pos
+            pi, pj = p
+            # doit être voisin immédiat
+            neigh = False
+            for _, (ni, nj) in state.get_neighbours(li, lj).values():
+                if (ni, nj) == p:
+                    neigh = True
+                    break
+            if not neigh:
+                return False
+            # direction "avant" grossière
+            if opp_type == "R":  # adversaire vise vertical (haut->bas)
+                if li < (n // 2):
+                    return pi >= li  # aller vers le bas
+                else:
+                    return pi <= li  # remonter vers le haut
+            else:  # adversaire vise horizontal (gauche->droite)
+                if lj < (n // 2):
+                    return pj >= lj  # aller vers la droite
+                else:
+                    return pj <= lj  # aller vers la gauche
+
+        # Score chaque action + collecte des raisons
+        w_opp, w_my = 1.0, 0.3
+        scored: list[tuple[LightAction, float]] = []
+        debug_rows: list[tuple[str, float, int, float, float, bool, int, float, bool]] = []
         for a in actions:
             pos = a.data.get("position")
             if not (isinstance(pos, tuple) and len(pos) == 2):
                 continue
-            
-            # Éval de base
+
+            # Enfant
             child = cast(GameStateHex, state.apply_action(a))
-            score = self._root_order_score(child)
-            
-            # Bonus épine + bridges + gradient (P3.2)
-            spine_bonus = self._bridge_guided_bonus(state, pos, spine)
-            score += spine_bonus
-            
-            # Bonus adjacence
-            adj = self._friendly_neighbors_count(state, pos, self.piece_type)
-            score += 0.18 * (adj / 6.0)
-            
-            # Bonus réduction bord
+
+            # 1) Score de base (inclut déjà dist pondérée via _root_order_score)
+            base_score = self._root_order_score(child)
+
+            # 2) Renfort explicite sur Δ distance adverse (très fort) avec urgence
+            d_opp1 = self._connection_distance(child, opp_type)
+            d_my1 = self._connection_distance(child, my_type)
+            delta_opp = (d_opp1 - opp_dist0) / max(1, n)
+            delta_my = (my_dist0 - d_my1) / max(1, n)
+            score = base_score + urgency * (1.20 * (w_opp * delta_opp)) + 0.20 * (max(0.0, delta_my))  # favoriser surtout +Δ_opp
+
+            # Pénalité forte si on ne fait pas monter d_opp quand il est bas
+            penalty_no_raise = False
+            if opp_dist0 <= 8 and d_opp1 <= opp_dist0:
+                score -= (1.2 if opp_dist0 <= 6 else 0.6)
+                penalty_no_raise = True
+
+            # 3) Bonus épine + bridges + gradient
+            bbonus = self._bridge_guided_bonus(state, pos, spine)
+            score += bbonus
+
+            # 4) Bonus adjacence douce
+            adj = self._friendly_neighbors_count(state, pos, my_type)
+            score += 0.12 * (adj / 6.0)
+
+            # 5) Bonus réduction bord
             if pos in border_reduce:
-                score += 0.12
-            
-            # Bonus si création/complétion d'un ziggurat
-            zig_bonus = self._ziggurat_formation_bonus(state, pos)
-            score += zig_bonus
-            
-            # Bonus biais de flanc
-            if last_pos:
-                if self.piece_type == "B":
-                    if (last_pos[1] <= 1 and pos[1] == 1) or (last_pos[1] >= n-2 and pos[1] == n-2):
-                        score += 0.06
-                else:
-                    if (last_pos[0] <= 1 and pos[0] == 1) or (last_pos[0] >= n-2 and pos[0] == n-2):
-                        score += 0.06
-            
-            # Pénalité trous adverses (sauf si tactique)
+                score += 0.10
+
+            # 6) Bonus ziggurat formation (léger)
+            score += self._ziggurat_formation_bonus(state, pos)
+
+            # 7) Bonus frontal si on coiffe le dernier coup adverse (mur immédiat)
+            front = is_front_cap(pos)
+            if front:
+                score += 1.50  # encore plus fort pour remonter en tête
+
+            # 8) Pénalité trous bridges adverses (sauf si terminal gagnant)
             if pos in opp_bridge_holes:
-                child_tmp = cast(GameStateHex, state.apply_action(a))
-                if self._utility(child_tmp) != 1:
+                if self._utility(child) != 1:
                     score -= 0.12
-            
+
             scored.append((a, score))
-        
+
+            # Collecte debug (notation algébrique, top-K affiché après tri)
+            try:
+                an = self._pos_to_an(pos, n)
+                dsp = self._dist_to_spine(pos, spine)
+                debug_rows.append((
+                    an, score, d_opp1, delta_opp, delta_my, front, dsp, bbonus, penalty_no_raise
+                ))
+            except Exception:
+                pass
+
         scored.sort(key=lambda t: t[1], reverse=True)
+
+        # Logs top-K
+        if self._debug and scored:
+            K = min(self._root_log_top_k, len(scored))
+            print(f"[MyPlayer][order] opp_d0={opp_dist0} my_d0={my_dist0} urgency={urgency:.2f} top{K}:")
+            # Refaire un mapping pos->row pour tri synchronisé
+            # Construire un dict pour lookup rapide
+            dbg_map = {row[0]: row for row in debug_rows}  # key = an
+            for idx in range(K):
+                pos = scored[idx][0].data.get("position")
+                if isinstance(pos, tuple):
+                    an = self._pos_to_an(pos, n)
+                    row = dbg_map.get(an)
+                    if row:
+                        _, sc, d1, d_opp, d_my, front, dsp, bbonus, pen = row
+                        print(f"  {idx+1:02d}) {an} sc={sc:+.3f} d_opp1={d1} Δopp={d_opp:+.3f} Δmy={d_my:+.3f} front={int(front)} spine={dsp} bbonus={bbonus:+.2f} penNoRaise={int(pen)}")
+
         return [a for a, _ in scored]
 
     def _order_actions_simple(self, state: GameStateHex, actions: list[LightAction]) -> list[LightAction]:
-        """Ordonnancement simplifié pour les niveaux profonds"""
+        """Ordonnancement simplifié pour les niveaux profonds (priorise l'augmentation de la distance adverse)"""
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+        my_type = self.piece_type
+        opp_type = "B" if my_type == "R" else "R"
+        w_opp, w_my = 1.0, 0.3
+        d_opp0 = self._connection_distance(state, opp_type)
+        urgency = 1.0 + max(0, 10 - d_opp0) * 0.35
         scored = []
         for a in actions:
             child = cast(GameStateHex, state.apply_action(a))
-            score = self._fast_static_eval(child)
+            d_opp = self._connection_distance(child, opp_type)
+            d_my = self._connection_distance(child, my_type)
+            dist = (w_opp * d_opp - w_my * d_my) / max(1, n)
+            score = self._fast_static_eval(child) + 1.0 * dist * urgency
             scored.append((a, score))
         scored.sort(key=lambda t: t[1], reverse=True)
         return [a for a, _ in scored]
 
     # ========== HELPERS TACTIQUES ==========
+
+    def _forced_advance2_if_needed(self, state: GameStateHex, last_pos: Optional[tuple[int,int]]) -> Optional[LightAction]:
+        """Après 3 near-block consécutifs, tenter un advance2.
+        Par défaut on exige la sûreté (pas de must-block pour l'adversaire après notre coup).
+        Si self._force_advance_2_even_if_threat est True, on force quand même (dangereux).
+        Inclut un fallback 'corridor' devant le dernier coup adverse si l'avance directe n'existe pas.
+        """
+        if self._consecutive_near_blocks < 3:
+            if self._debug:
+                print(f"[MyPlayer][forced] skip: streak<{3} (={self._consecutive_near_blocks})")
+            return None
+
+        my_type = self.piece_type
+        opp_type = "B" if my_type == "R" else "R"
+
+        # Meilleur coup adverse actuel
+        bests = self._best_opponent_moves(state, k=1)
+        if not bests:
+            if self._debug:
+                print("[MyPlayer][forced] skip: no_best_opp_move")
+            return None
+        p_best, _, _ = bests[0]
+
+        # Projeter une avancée de 2 cases dans sa direction
+        adv = self._advance_two_forward(state, p_best, opp_type)
+        # Fallback: essayer un couloir devant le dernier coup adverse (ou p_best)
+        if adv is None:
+            rep = cast(BoardHex, state.get_rep())
+            env = rep.get_env()
+            ref = last_pos if last_pos else p_best
+            tried = []
+            for cand in self._forward_candidates(state, ref, opp_type):
+                tried.append(cand)
+                if env.get(cand) is None:
+                    adv = cand
+                    break
+            if self._debug and adv is None:
+                n_dbg = rep.get_dimensions()[0]
+                tried_an = [self._pos_to_an(c, n_dbg) for c in tried]
+                print(f"[MyPlayer][forced] corridor fallback failed, tried={tried_an}")
+            if adv is None:
+                return None
+
+        # Sûreté: après notre advance2, l'adversaire ne doit pas gagner en 1
+        child = cast(GameStateHex, state.apply_action(LightAction({"piece": my_type, "position": adv})))
+        threats = self._must_block_cells(child)
+        if threats and not getattr(self, "_force_advance2_even_if_threat", self._force_advance2_even_if_threat):
+            if self._debug:
+                print(f"[MyPlayer][forced] skip: unsafe threats={len(threats)} after advance2")
+            return None
+
+        # Retourner l'action légale correspondante
+        for a in state.get_possible_light_actions():
+            if a.data.get("position") == adv:
+                if self._debug:
+                    n_dbg = cast(BoardHex, state.get_rep()).get_dimensions()[0]
+                    print(f"[MyPlayer][forced] advance2 -> {self._pos_to_an(adv, n_dbg)} after {self._consecutive_near_blocks} near-blocks (unsafe_allowed={len(threats)>0})")
+                return a
+        if self._debug:
+            print("[MyPlayer][forced] skip: adv not legal anymore")
+        return None
+
+    def _best_opponent_moves(self, state: GameStateHex, k: int = 3) -> list[tuple[tuple[int,int], int, int]]:
+        """Top-k coups adverses qui minimisent sa distance de connexion.
+        Retourne [(pos, d1, delta)] triés par d1 croissant puis delta décroissant.
+        """
+        rep = cast(BoardHex, state.get_rep())
+        opp_type = "B" if self.piece_type == "R" else "R"
+        d0 = self._connection_distance(state, opp_type)
+        items: list[tuple[tuple[int,int], int, int]] = []
+        empties = list(rep.get_empty())
+        n = rep.get_dimensions()[0]
+
+        for pos in empties:
+            if time.perf_counter() > self._deadline:
+                break
+            child = cast(GameStateHex, state.apply_action(LightAction({"piece": opp_type, "position": pos})))
+            d1 = self._connection_distance(child, opp_type)
+            delta = d0 - d1
+            items.append((pos, d1, delta))
+
+        items.sort(key=lambda t: (t[1], -t[2]))
+        return items[:k]
+
+    def _advance_two_forward(self, state: GameStateHex, base: tuple[int,int], opp_type: str) -> Optional[tuple[int,int]]:
+        """Heuristique: avancer de 1-2 cases DEVANT l'adversaire, dans la direction de sa connexion cible.
+        - Rouge (R) connecte TOP->BOTTOM: avancer vers le bas (i+)
+        - Bleu (B) connecte LEFT->RIGHT: avancer vers la droite (j+)
+        Tente d'abord +2, puis +1.
+        """
+        rep = cast(BoardHex, state.get_rep())
+        env = rep.get_env()
+        n = rep.get_dimensions()[0]
+        i, j = base
+
+        if opp_type == "R":  # vertical (TOP -> BOTTOM)
+            steps = [(i + 2, j), (i + 1, j)]
+        else:  # "B" horizontal (LEFT -> RIGHT)
+            steps = [(i, j + 2), (i, j + 1)]
+
+        for ti, tj in steps:
+            if 0 <= ti < n and 0 <= tj < n and env.get((ti, tj)) is None:
+                return (ti, tj)
+        return None
+
+    def _forward_candidates(self, state: GameStateHex, ref: tuple[int,int], opp_type: str) -> list[tuple[int,int]]:
+        """Liste de cellules 'corridor' devant ref, avec tolérance latérale ±1.
+        Ordre de priorité: +2 avant, puis +1, en préférant la même colonne/ligne puis latérales.
+        """
+        rep = cast(BoardHex, state.get_rep())
+        n = rep.get_dimensions()[0]
+        i, j = ref
+        cands: list[tuple[int,int]] = []
+        if opp_type == "R":
+            base2 = [(i + 2, j), (i + 2, j - 1), (i + 2, j + 1)]
+            base1 = [(i + 1, j), (i + 1, j - 1), (i + 1, j + 1)]
+        else:
+            base2 = [(i, j + 2), (i - 1, j + 2), (i + 1, j + 2)]
+            base1 = [(i, j + 1), (i - 1, j + 1), (i + 1, j + 1)]
+        for (ti, tj) in base2 + base1:
+            if 0 <= ti < n and 0 <= tj < n:
+                cands.append((ti, tj))
+        return cands
+
+    def _adversary_emulation_response(self, state: GameStateHex, last_pos: Optional[tuple[int,int]]) -> Optional[LightAction]:
+        """Se mettre dans la peau de l'adversaire:
+         - Évaluer son meilleur coup p* (réduction max de sa distance).
+         - Forcer advance2 si on a déjà joué 3 near-block d'affilée.
+         - Sinon: logique habituelle (block_best si Δ≥2 ou d_opp≤8, sinon tenter advance2).
+         Met à jour self._consecutive_near_blocks selon le choix retenu.
+        """
+        my_type = self.piece_type
+        opp_type = "B" if my_type == "R" else "R"
+
+        bests = self._best_opponent_moves(state, k=3)
+        if not bests:
+            # Aucun signal adverse exploitable -> ne pas compter comme near-block
+            return None
+
+        opp_d0 = self._connection_distance(state, opp_type)
+        p_best, d1, delta = bests[0]
+
+        if self._debug:
+            n_dbg = cast(BoardHex, state.get_rep()).get_dimensions()[0]
+            rows = ", ".join([f"{self._pos_to_an(p, n_dbg)} d1={d} Δ={dlta}" for (p, d, dlta) in bests])
+            print(f"[MyPlayer][opp] d0={opp_d0} bests=[{rows}] streak_near={self._consecutive_near_blocks}")
+
+        target_pos: Optional[tuple[int,int]] = None
+        reason = "block_best"
+
+        # 1) FORCING: si 3 near-block consécutifs, forcer advance2
+        if self._consecutive_near_blocks >= 3:
+            adv = self._advance_two_forward(state, p_best, opp_type)
+            if adv is not None:
+                target_pos = adv
+                reason = "forced_advance2"
+            else:
+                # Si impossible, fallback blocage
+                target_pos = p_best
+                reason = "forced_fallback_block"
+        else:
+            # 2) Règle normale: blocage si menace forte, sinon tenter advance2
+            if delta >= 2 or opp_d0 <= 8:
+                # Correctif: comparer blocage direct (p_best) vs "front-cap" autour de last_pos,
+                # et choisir celui qui maximise la distance adverse d_opp après notre coup (tie -> front-cap).
+                rep = cast(BoardHex, state.get_rep())
+                env = rep.get_env()
+                n = rep.get_dimensions()[0]
+
+                best_front: Optional[tuple[int,int]] = None
+                best_front_d: int = -1
+
+                if last_pos:
+                    li, lj = last_pos
+                    for _, (ni, nj) in state.get_neighbours(li, lj).values():
+                        if not (0 <= ni < n and 0 <= nj < n):
+                            continue
+                        if env.get((ni, nj)) is not None:
+                            continue
+                        if opp_type == "R":
+                            forward = (ni >= li) if li < (n // 2) else (ni <= li)
+                            lateral = abs(nj - lj) <= 1
+                        else:
+                            forward = (nj >= lj) if lj < (n // 2) else (nj <= lj)
+                            lateral = abs(ni - li) <= 1
+                        if forward and lateral:
+                            child_fc = cast(GameStateHex, state.apply_action(LightAction({"piece": my_type, "position": (ni, nj)})))
+                            d_fc = self._connection_distance(child_fc, opp_type)
+                            if d_fc > best_front_d:
+                                best_front_d = d_fc
+                                best_front = (ni, nj)
+
+                # Distance après blocage p_best
+                child_block = cast(GameStateHex, state.apply_action(LightAction({"piece": my_type, "position": p_best})))
+                d_block = self._connection_distance(child_block, opp_type)
+
+                if best_front is not None and best_front_d >= d_block:
+                    target_pos = best_front
+                    reason = "front_cap"
+                else:
+                    target_pos = p_best
+                    reason = "block_best"
+            else:
+                adv = self._advance_two_forward(state, p_best, opp_type)
+                if adv:
+                    child_adv = cast(GameStateHex, state.apply_action(LightAction({"piece": my_type, "position": adv})))
+                    d_after = self._connection_distance(child_adv, opp_type)
+                    if d_after >= opp_d0 + 1 or d_after > d1:
+                        target_pos = adv
+                        reason = "advance2"
+                    else:
+                        target_pos = p_best
+                        reason = "fallback_block"
+                else:
+                    target_pos = p_best
+                    reason = "no_advance"
+
+        # Conversion en action légale + mise à jour du compteur
+        actions = list(state.get_possible_light_actions())
+        chosen: Optional[LightAction] = None
+        for a in actions:
+            pos = a.data.get("position")
+            if pos == target_pos:
+                chosen = a
+                break
+
+        if chosen is None:
+            # Si l'avance forcée n'était pas légale, tenter blocage p_best
+            for a in actions:
+                if a.data.get("position") == p_best:
+                    chosen = a
+                    reason = "forced_fallback_block" if reason.startswith("forced") else "block_best"
+                    break
+
+        if chosen is not None:
+            # MAJ du streak: +1 si blocage near, sinon reset
+            if "block" in reason:
+                self._consecutive_near_blocks += 1
+            else:
+                self._consecutive_near_blocks = 0
+            if self._debug:
+                n_dbg = cast(BoardHex, state.get_rep()).get_dimensions()[0]
+                pos_dbg = chosen.data.get("position")
+                if isinstance(pos_dbg, tuple):
+                    print(f"[MyPlayer][opp->play] {reason} -> {self._pos_to_an(pos_dbg, n_dbg)} streak_near={self._consecutive_near_blocks}")
+            return chosen
+
+        return None
+
 
     def _deduce_last_opponent_move(self, state: GameStateHex, curr_pos_set: set[tuple[int,int]]) -> Optional[tuple[int,int]]:
         """Déduit le dernier coup adverse par différence d'états"""
@@ -1463,7 +1889,7 @@ class MyPlayer(PlayerHex):
         return 0
 
     def _evaluate(self, state: GameStateHex) -> float:
-        """P2: Évaluation H1 (base + distance)"""
+        """P2: Évaluation H1 (base + distance) avec urgence si l'adversaire est proche de connecter."""
         if state.is_done():
             return float(self._utility(state))
         
@@ -1477,9 +1903,13 @@ class MyPlayer(PlayerHex):
         
         rep = cast(BoardHex, state.get_rep())
         n = rep.get_dimensions()[0]
-        dist_term = (opp_dist - my_dist) / max(1, n)
+        # Pondération asymétrique: on privilégie l'augmentation de la distance adverse
+        w_opp, w_my = 1.0, 0.3
+        dist_term = (w_opp * opp_dist - w_my * my_dist) / max(1, n)
+        # Urgence: plus opp_dist est petit, plus on renforce la distance
+        urgency = 1.0 + max(0, 10 - opp_dist) * 0.20
         
-        return float(0.35 * base + 0.65 * dist_term)
+        return float(0.30 * base + 0.70 * dist_term * urgency)
 
     def _fast_static_eval(self, state: GameStateHex) -> float:
         """Évaluation rapide: pions, ancrage, présence, centre, cluster"""
@@ -1530,7 +1960,7 @@ class MyPlayer(PlayerHex):
         
         val = 0.25 * piece_diff + 0.35 * anchor_term + 0.20 * presence_term + 0.15 * center_term + 0.05 * cluster_term
 
-        # Petit terme bridge (doux): +0.05 créer, +0.01 compléter, seulement si trous libres et pas de must-block
+        # Petit terme bridge (doux): +0.10 créer, +0.01 compléter, seulement si trous libres et pas de must-block
         try:
             if not self._must_block_cells(state):
                 has_create, has_complete = self._bridge_eval_flags(state, my_type)
@@ -1544,7 +1974,7 @@ class MyPlayer(PlayerHex):
         return max(-0.9, min(0.9, val))
 
     def _root_order_score(self, state: GameStateHex) -> float:
-        """Score pour ordonnancement racine: base + distance + ancrage"""
+        """Score pour ordonnancement racine: base + distance + ancrage (distance adverse priorisée)"""
         base = self._fast_static_eval(state)
         
         rep = cast(BoardHex, state.get_rep())
@@ -1554,13 +1984,15 @@ class MyPlayer(PlayerHex):
         
         d_my = self._connection_distance(state, my_type)
         d_opp = self._connection_distance(state, opp_type)
-        dist_term = (d_opp - d_my) / max(1, n)
+        w_opp, w_my = 1.0, 0.3
+        dist_term = (w_opp * d_opp - w_my * d_my) / max(1, n)
+        urgency = 1.0 + max(0, 10 - d_opp) * 0.20
         
         a_my = self._edge_anchor_score(state, my_type)
         a_opp = self._edge_anchor_score(state, opp_type)
         anchor_term = (a_opp - a_my) / max(1, n)
         
-        val = 0.35 * base + 0.45 * dist_term + 0.20 * anchor_term
+        val = 0.30 * base + 0.55 * dist_term * urgency + 0.15 * anchor_term
         return max(-0.9, min(0.9, val))
 
     # ========== HELPERS MÉTRIQUES ==========
