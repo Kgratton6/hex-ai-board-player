@@ -216,6 +216,12 @@ class MyPlayer(PlayerHex):
                             self._update_prev_positions(curr_pos_set, best_edge)
                             self._consecutive_near_blocks = 0
                             return best_edge
+                        
+        # PHASE 6.5: Emulation (fallback tardif si aucun coup structurel n'a été retenu)
+        emu_action = self._adversary_emulation_response(st_hex, last_pos)
+        if emu_action:
+            self._update_prev_positions(curr_pos_set, emu_action)
+            return emu_action
 
         # (supprimé) ancien edge double-threat
         # PHASE 7: IDS + Alpha-bêta avec toutes les optimisations
@@ -808,31 +814,35 @@ class MyPlayer(PlayerHex):
                 best_front: Optional[tuple[int,int]] = None
                 best_front_d: int = -1
 
+                # Front-cap: choisir STRICTEMENT un voisin vide de last_pos qui MAXIMISE d_opp après notre coup.
+                # Ajoute un log détaillé des candidats évalués pour debug.
                 if last_pos:
                     li, lj = last_pos
+                    dbg_list: list[tuple[tuple[int,int], int]] = []
                     for _, (ni, nj) in state.get_neighbours(li, lj).values():
                         if not (0 <= ni < n and 0 <= nj < n):
                             continue
                         if env.get((ni, nj)) is not None:
                             continue
-                        if opp_type == "R":
-                            forward = (ni >= li) if li < (n // 2) else (ni <= li)
-                            lateral = abs(nj - lj) <= 1
-                        else:
-                            forward = (nj >= lj) if lj < (n // 2) else (nj <= lj)
-                            lateral = abs(ni - li) <= 1
-                        if forward and lateral:
-                            child_fc = cast(GameStateHex, state.apply_action(LightAction({"piece": my_type, "position": (ni, nj)})))
-                            d_fc = self._connection_distance(child_fc, opp_type)
-                            if d_fc > best_front_d:
-                                best_front_d = d_fc
-                                best_front = (ni, nj)
+                        child_fc = cast(GameStateHex, state.apply_action(LightAction({"piece": my_type, "position": (ni, nj)})))
+                        d_fc = self._connection_distance(child_fc, opp_type)
+                        dbg_list.append(((ni, nj), d_fc))
+                        if d_fc > best_front_d:
+                            best_front_d = d_fc
+                            best_front = (ni, nj)
+                    if self._debug:
+                        n_dbg = cast(BoardHex, state.get_rep()).get_dimensions()[0]
+                        an_last = self._pos_to_an((li, lj), n_dbg)
+                        cand_str = ", ".join([f"{self._pos_to_an(p, n_dbg)}:{d}" for (p, d) in dbg_list])
+                        chosen_str = self._pos_to_an(best_front, n_dbg) if best_front is not None else "None"
+                        print(f"[MyPlayer][frontcap] last={an_last} cands=[{cand_str}] choose={chosen_str} d={best_front_d}")
 
-                # Distance après blocage p_best
+                # Distance après blocage p_best (diag)
                 child_block = cast(GameStateHex, state.apply_action(LightAction({"piece": my_type, "position": p_best})))
                 d_block = self._connection_distance(child_block, opp_type)
 
-                if best_front is not None and best_front_d >= d_block:
+                # Politique: toute réponse "near" privilégie le front-cap si disponible
+                if best_front is not None:
                     target_pos = best_front
                     reason = "front_cap"
                 else:
@@ -853,6 +863,38 @@ class MyPlayer(PlayerHex):
                     target_pos = p_best
                     reason = "no_advance"
 
+        # Préférence globale: si la réponse courante est un blocage "near" (p_best)
+        # et qu'un front-cap existe autour de last_pos, on remplace par le front-cap qui MAXIMISE d_opp.
+        if last_pos is not None and target_pos == p_best:
+            rep = cast(BoardHex, state.get_rep())
+            env = rep.get_env()
+            n = rep.get_dimensions()[0]
+            li, lj = last_pos
+            best_front_override: Optional[tuple[int,int]] = None
+            best_front_override_d: int = -1
+            dbg_list2: list[tuple[tuple[int,int], int]] = []
+            for _, (ni, nj) in state.get_neighbours(li, lj).values():
+                if not (0 <= ni < n and 0 <= nj < n):
+                    continue
+                if env.get((ni, nj)) is not None:
+                    continue
+                child_fc = cast(GameStateHex, state.apply_action(LightAction({"piece": my_type, "position": (ni, nj)})))
+                d_fc = self._connection_distance(child_fc, opp_type)
+                dbg_list2.append(((ni, nj), d_fc))
+                if d_fc > best_front_override_d:
+                    best_front_override_d = d_fc
+                    best_front_override = (ni, nj)
+            if self._debug:
+                n_dbg = cast(BoardHex, state.get_rep()).get_dimensions()[0]
+                an_last = self._pos_to_an((li, lj), n_dbg)
+                cand_str2 = ", ".join([f"{self._pos_to_an(p, n_dbg)}:{d}" for (p, d) in dbg_list2])
+                chosen2 = self._pos_to_an(best_front_override, n_dbg) if best_front_override is not None else "None"
+                pbest_an = self._pos_to_an(p_best, n_dbg)
+                print(f"[MyPlayer][frontcap-override] last={an_last} p_best={pbest_an} cands=[{cand_str2}] choose={chosen2} d={best_front_override_d}")
+            if best_front_override is not None:
+                target_pos = best_front_override
+                reason = "front_cap"
+
         # Conversion en action légale + mise à jour du compteur
         actions = list(state.get_possible_light_actions())
         chosen: Optional[LightAction] = None
@@ -871,8 +913,8 @@ class MyPlayer(PlayerHex):
                     break
 
         if chosen is not None:
-            # MAJ du streak: +1 si blocage near, sinon reset
-            if "block" in reason:
+            # MAJ du streak: compter 'front_cap' comme near-block également
+            if reason in ("block_best", "forced_fallback_block", "front_cap"):
                 self._consecutive_near_blocks += 1
             else:
                 self._consecutive_near_blocks = 0
